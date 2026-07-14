@@ -279,6 +279,7 @@ struct Encoder {
 };
 
 static void raop_pipe_push(float l, float r);
+static bool raop_is_running();
 
 DEFINE_GUID(IID_IAudioClient3_L, 0x7ED4EE07, 0x8E67, 0x4CD4,
             0x8C, 0x1A, 0x2B, 0x7A, 0x59, 0x87, 0xAD, 0x42);
@@ -1498,7 +1499,25 @@ static void layout_renderer_buttons(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, TRUE);
 }
 
+static void sync_airplay_button_state() {
+    static bool was_running = false;
+    bool running = raop_is_running();
+    if (was_running && !running) {
+        bool changed = false;
+        EnterCriticalSection(&G.cs);
+        for (auto& d : g_airplay)
+            if (d.streaming) { d.streaming = false; changed = true; }
+        LeaveCriticalSection(&G.cs);
+        if (changed) {
+            ui_log(L"[raop] session ended \x2014 button reset");
+            PostMessageW(G.hwnd, WM_APP_RENDERS, 1, 0);
+        }
+    }
+    was_running = running;
+}
+
 static void update_stats() {
+    sync_airplay_button_state();
     Fmt f = (Fmt)G.fmt.load();
     uint32_t rate = G.sample_rate.load();
     uint64_t backlog10 = G.backlog_ms_x10.load();
@@ -1854,6 +1873,7 @@ struct RaopSession {
     uint32_t latency_frames = 15435;             // ~350 ms @44.1k — OUR choice
     std::atomic<uint64_t> frames_sent{0};
     std::atomic<uint64_t> resends{0};
+    std::atomic<uint64_t> last_timing_ms{0};     // receiver heartbeat (0xD2 seen)
     HANDLE thread = nullptr, tim_thread = nullptr, ctrl_thread = nullptr;
     // retransmit history: last 1024 RTP packets (~8 s), guarded by hist_cs
     CRITICAL_SECTION hist_cs;
@@ -1912,6 +1932,7 @@ static DWORD WINAPI raop_timing_thread(LPVOID) {
         int n = recvfrom(RA.tim_sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
         if (n < 32) continue;
         if ((uint8_t)buf[1] != 0xD2) continue;
+        RA.last_timing_ms.store(now_ms());
         uint8_t rep[32] = {0};
         rep[0] = 0x80; rep[1] = 0xD3; rep[2] = 0x00; rep[3] = 0x07;
         memcpy(rep + 8, buf + 24, 8);            // originate = their transmit
@@ -2086,7 +2107,7 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
     double src_pos = 0.0;
     float pl = 0.f, pr = 0.f;                     // previous src frame for interp
     bool first_pkt = true;
-    uint64_t sent_frames = 0, last_sync = now_ms();
+    uint64_t sent_frames = 0, last_sync = now_ms(), last_ka = now_ms();
     bool was_streaming = false, discontinuity = false;
     uint64_t resync_burst_until = 0;
     uint64_t starve_since = 0;                   // gate: real gap vs momentary poll
@@ -2202,30 +2223,54 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
         uint64_t sync_interval = (now_ms() < resync_burst_until) ? 50 : 1000;
         if (now_ms() - last_sync >= sync_interval) { raop_send_sync(false); last_sync = now_ms(); }
 
-        // RTSP keepalive: some receivers kill sessions with an idle control
-        // connection. A cheap SET_PARAMETER every 20 s keeps it alive and
-        // doubles as a liveness check for auto-reconnect.
-        static uint64_t last_ka = 0;
+        // Liveness: (a) RTSP keepalive every 20 s, one quick retry before
+        // declaring death; (b) receiver timing-request heartbeat — real
+        // receivers ping every ~3 s, so >8 s of silence means the session is
+        // gone long before the keepalive would notice.
+        bool session_dead = false;
         if (now_ms() - last_ka >= 20000) {
             last_ka = now_ms();
             bool alive = false;
             c.request("SET_PARAMETER", c.uri, "Content-Type: text/parameters",
                       "volume: -0.0\r\n", &alive);
-            if (!alive) {
-                ui_log(L"[raop] session dropped by receiver \x2014 reconnecting...");
+            if (!alive) {                          // one benefit-of-the-doubt retry
+                Sleep(700);
+                c.request("SET_PARAMETER", c.uri, "Content-Type: text/parameters",
+                          "volume: -0.0\r\n", &alive);
+            }
+            session_dead = !alive;
+        }
+        {
+            uint64_t lt = RA.last_timing_ms.load();
+            if (lt && now_ms() - lt > 8000) session_dead = true;
+        }
+
+        if (session_dead) {
+            // PERSISTENT reconnect: a session ends when the user says so, not
+            // when the network hiccups. Retry until STOP is pressed.
+            ui_log(L"[raop] session lost \x2014 reconnecting until it returns...");
+            int attempt = 0;
+            bool back = false;
+            while (RA.run.load()) {
                 c.close();
                 closesocket(RA.ctrl_sock); closesocket(RA.tim_sock); closesocket(RA.audio_sock);
-                Sleep(400);
-                if (raop_handshake()) {
-                    dst.sin_port = htons((u_short)RA.srv_audio);
-                    inet_pton(AF_INET, RA.host.c_str(), &dst.sin_addr);
-                    first_pkt = true;
-                    sent_frames = 0;
-                    ui_log(L"[raop] reconnected");
-                } else {
-                    ui_log(L"[raop] reconnect failed \x2014 stopping");
-                    RA.run.store(false);
+                Sleep(attempt == 0 ? 400 : 2500);
+                attempt++;
+                if (raop_handshake()) { back = true; break; }
+                if (attempt == 1 || attempt % 6 == 0) {
+                    wchar_t b[96];
+                    swprintf(b, 96, L"[raop] still trying (attempt %d)...", attempt);
+                    ui_log(b);
                 }
+            }
+            if (back) {
+                dst.sin_port = htons((u_short)RA.srv_audio);
+                inet_pton(AF_INET, RA.host.c_str(), &dst.sin_addr);
+                first_pkt = true;
+                sent_frames = 0;
+                RA.last_timing_ms.store(0);
+                last_ka = now_ms();
+                ui_log(L"[raop] reconnected \x2014 stream resumed");
             }
         }
     }
@@ -2250,6 +2295,7 @@ static void raop_start(const std::string& host, int port, uint32_t latency_ms) {
     RA.thread = CreateThread(nullptr, 0, raop_stream_thread, nullptr, 0, nullptr);
     ui_log8("[raop] starting AirPlay session to " + host + ":" + std::to_string(port));
 }
+static bool raop_is_running() { return RA.run.load(); }
 static void raop_stop() {
     if (!RA.run.load()) return;
     RA.run.store(false);
