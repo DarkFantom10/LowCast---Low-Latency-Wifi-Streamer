@@ -11,6 +11,9 @@ LowCast is a native Windows application that captures system audio with WASAPI l
 
 The tool locations are set near the top of `build.ps1`; update them if your Visual Studio or SDK installation differs.
 
+## Firmware
+Hifiman firmware was provided by their customer service team for this project. Airplay v1 functionality is required for LowCast to use low latency streaming. Airplay v2 has built in encryption and thus was determined to not meet my latency requirements.
+
 ## Build
 
 From PowerShell in the repository root:
