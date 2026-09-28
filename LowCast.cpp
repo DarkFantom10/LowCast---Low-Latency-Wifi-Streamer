@@ -3076,6 +3076,26 @@ static void append_log_line(HWND edit, const std::wstring& text) {
     SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
 }
 
+static HBRUSH apply_main_static_colors(HWND control, HDC dc) {
+    if (control == G.flash) {
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, G.flash_state ? CLR_FLASH_TXT : CLR_TEXT);
+        return G.flash_state ? g_br_flash_on : g_br_surface;
+    }
+    // ES_READONLY EDIT controls use WM_CTLCOLORSTATIC. Their text background
+    // must be opaque or scrolling can leave old glyphs behind.
+    if (control == G.log) {
+        SetBkMode(dc, OPAQUE);
+        SetBkColor(dc, CLR_BG);
+        SetTextColor(dc, CLR_TEXT);
+        return g_br_bg;
+    }
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, (control == G.stat || control == G.lbl_batt)
+                         ? CLR_SECONDARY : CLR_TEXT);
+    return g_br_bg;
+}
+
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_CREATE: {
@@ -3479,17 +3499,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_CTLCOLORSTATIC:
-        if ((HWND)lp == G.flash) {
-            HDC dc = (HDC)wp;
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, G.flash_state ? CLR_FLASH_TXT : CLR_TEXT);
-            return (LRESULT)(G.flash_state ? g_br_flash_on : g_br_surface);
-        }
-        SetBkMode((HDC)wp, TRANSPARENT);
-        SetTextColor((HDC)wp,
-                     ((HWND)lp == G.stat || (HWND)lp == G.lbl_batt)
-                         ? CLR_SECONDARY : CLR_TEXT);
-        return (LRESULT)g_br_bg;
+        return (LRESULT)apply_main_static_colors((HWND)lp, (HDC)wp);
     case WM_CTLCOLOREDIT:
         SetBkColor((HDC)wp, CLR_SURFACE);
         SetTextColor((HDC)wp, CLR_TEXT);

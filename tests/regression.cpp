@@ -225,6 +225,96 @@ static void test_log_trim_keeps_newest_complete_lines() {
     DestroyWindow(bounded);
 }
 
+struct EditColorProbe {
+    int static_messages = 0;
+    int edit_messages = 0;
+};
+
+static LRESULT CALLBACK edit_color_probe_proc(HWND hwnd, UINT message,
+                                               WPARAM wp, LPARAM lp) {
+    EditColorProbe* probe = reinterpret_cast<EditColorProbe*>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (message == WM_CTLCOLORSTATIC) {
+        if (probe) ++probe->static_messages;
+        return (LRESULT)GetStockObject(BLACK_BRUSH);
+    }
+    if (message == WM_CTLCOLOREDIT) {
+        if (probe) ++probe->edit_messages;
+        return (LRESULT)GetStockObject(BLACK_BRUSH);
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+}
+
+static void test_readonly_log_uses_opaque_static_colors() {
+    const wchar_t* class_name = L"LowCastEditColorProbe";
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = edit_color_probe_proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = class_name;
+    ATOM atom = RegisterClassW(&wc);
+    EXPECT(atom != 0);
+    if (!atom) return;
+
+    EditColorProbe probe;
+    HWND parent = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        class_name, L"", WS_POPUP | WS_VISIBLE, -32000, -32000, 320, 160,
+        nullptr, nullptr, wc.hInstance, nullptr);
+    if (parent) SetWindowLongPtrW(parent, GWLP_USERDATA, (LONG_PTR)&probe);
+    HWND readonly_edit = CreateWindowW(L"EDIT", L"paint probe",
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY,
+        0, 0, 320, 75, parent, nullptr, wc.hInstance, nullptr);
+    HWND writable_edit = CreateWindowW(L"EDIT", L"editable probe",
+        WS_CHILD | WS_VISIBLE | ES_MULTILINE,
+        0, 80, 320, 75, parent, nullptr, wc.hInstance, nullptr);
+    EXPECT(parent && readonly_edit && writable_edit);
+    if (parent && readonly_edit && writable_edit) {
+        InvalidateRect(readonly_edit, nullptr, TRUE);
+        UpdateWindow(readonly_edit);
+        EXPECT(probe.static_messages > 0);
+        EXPECT(probe.edit_messages == 0);
+        InvalidateRect(writable_edit, nullptr, TRUE);
+        UpdateWindow(writable_edit);
+        EXPECT(probe.edit_messages > 0);
+    }
+
+    HDC dc = CreateCompatibleDC(nullptr);
+    EXPECT(dc != nullptr);
+    if (dc && readonly_edit) {
+        HWND old_log = G.log;
+        HWND old_flash = G.flash;
+        HWND old_stat = G.stat;
+        HWND old_batt = G.lbl_batt;
+        G.log = readonly_edit;
+        G.flash = nullptr;
+        G.stat = nullptr;
+        G.lbl_batt = nullptr;
+        SetBkMode(dc, TRANSPARENT);
+        HBRUSH brush = apply_main_static_colors(readonly_edit, dc);
+        EXPECT(brush == g_br_bg);
+        EXPECT(GetBkMode(dc) == OPAQUE);
+        EXPECT(GetBkColor(dc) == CLR_BG);
+        EXPECT(GetTextColor(dc) == CLR_TEXT);
+
+        HWND ordinary_static = parent;
+        SetBkMode(dc, OPAQUE);
+        brush = apply_main_static_colors(ordinary_static, dc);
+        EXPECT(brush == g_br_bg);
+        EXPECT(GetBkMode(dc) == TRANSPARENT);
+        G.log = old_log;
+        G.flash = old_flash;
+        G.stat = old_stat;
+        G.lbl_batt = old_batt;
+        DeleteDC(dc);
+    } else if (dc) {
+        DeleteDC(dc);
+    }
+
+    if (writable_edit) DestroyWindow(writable_edit);
+    if (readonly_edit) DestroyWindow(readonly_edit);
+    if (parent) DestroyWindow(parent);
+    UnregisterClassW(class_name, wc.hInstance);
+}
+
 static bool volume_press_drags(HWND track, int x, int y) {
     SendMessageW(track, TBM_SETPOS, TRUE, 50);
     SendMessageW(track, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y));
@@ -276,6 +366,7 @@ int main() {
     test_hidden_battery_alert_window();
     test_airplay_flag_clears_without_session();
     test_log_trim_keeps_newest_complete_lines();
+    test_readonly_log_uses_opaque_static_colors();
     test_volume_visible_edge_starts_drag();
     UnregisterClassW(BATTERY_ALERT_CLASS, GetModuleHandleW(nullptr));
     free_dark_resources();
