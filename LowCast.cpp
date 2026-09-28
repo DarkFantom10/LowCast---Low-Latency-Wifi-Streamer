@@ -19,7 +19,7 @@
 // ============================================================================
 
 #define WIN32_LEAN_AND_MEAN
-#define _WIN32_WINNT 0x0601
+#define _WIN32_WINNT 0x0602
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -28,6 +28,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <initguid.h>
+#include "resource.h"
+#include "volume_track_renderer.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -36,6 +38,8 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <shellapi.h>
+#include <shobjidl_core.h>
 #include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -89,12 +93,68 @@ static std::string xml_escape(const std::string& in) {
     }
     return out;
 }
-static uint64_t now_ms() {
+// ---------------------------------------------------------------------------
+// One monotonic clock for everything time-critical (packet scheduling, the
+// duplicate queue, diagnostics cadence, AND the AirPlay NTP timestamps).
+//
+// Base: the kernel's interrupt-time tick (QueryUnbiasedInterruptTime): system-
+// wide, monotonic, ~1 ms resolution while the 1 ms timer is honored, immune to
+// wall-clock steps AND to per-core TSC skew. QueryPerformanceCounter only
+// refines the sub-tick part and is trusted only while it agrees with the tick
+// clock: the log shows the stream thread's QPC reading ~5.5 s BEHIND for
+// several seconds (2026-09-02 23:48, 2026-09-05 02:11) while the capture
+// thread's clock stayed correct (i9-12900K, hybrid P/E cores). Each such
+// disagreement is counted in g_clock_glitches and shown as clk= in [diag].
+// ---------------------------------------------------------------------------
+static std::atomic<uint64_t> g_clock_glitches{0};   // QPC disagreed with the tick clock (>20 ms)
+static uint64_t mono_100ns() {
     static LARGE_INTEGER freq = {};
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    return (uint64_t)(t.QuadPart * 1000ULL / (uint64_t)freq.QuadPart);
+    static std::atomic<int64_t>  clk_delta{INT64_MIN};  // tick - qpc(100ns) at last re-base
+    static std::atomic<uint64_t> clk_last{0};           // monotonic clamp across threads
+    static std::atomic<uint64_t> clk_agree{0};          // tick time of the last agreement
+    ULONGLONG it = 0; QueryUnbiasedInterruptTime(&it);
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    const int64_t f = freq.QuadPart;
+    int64_t q100 = (q.QuadPart / f) * 10000000LL + (q.QuadPart % f) * 10000000LL / f;
+    int64_t delta = clk_delta.load(std::memory_order_relaxed);
+    uint64_t v;
+    if (delta == INT64_MIN) {
+        clk_delta.store((int64_t)it - q100, std::memory_order_relaxed);
+        clk_agree.store(it, std::memory_order_relaxed);
+        v = it;
+    } else {
+        // Healthy: est is true time and the tick lags it by up to one tick, so
+        // est - it sits in [0, tick]. Beyond +-20 ms QPC is lying (per-core
+        // skew): count it and use the tick. More than 3 ms BEHIND the tick can
+        // only be QPC running slow: re-base. (Ahead by 3..20 ms is just tick
+        // staleness when the 1 ms timer is not honored: still true time.)
+        int64_t err = q100 + delta - (int64_t)it;
+        if (err > 200000 || err < -200000) {
+            g_clock_glitches.fetch_add(1, std::memory_order_relaxed);
+            v = it;
+            // A lasting offset (anchor taken on a skewed core, S3 re-bias) would
+            // glitch forever: if NO thread has agreed for 2 s, re-base. While any
+            // healthy thread keeps agreeing, a skewed core never re-bases.
+            int64_t agree_age = (int64_t)it - (int64_t)clk_agree.load(std::memory_order_relaxed);
+            if (agree_age > 20000000LL) {
+                clk_delta.store((int64_t)it - q100, std::memory_order_relaxed);
+                clk_agree.store(it, std::memory_order_relaxed);
+            }
+        } else if (err < -30000) {
+            clk_delta.store((int64_t)it - q100, std::memory_order_relaxed);
+            clk_agree.store(it, std::memory_order_relaxed);
+            v = it;
+        } else {
+            clk_agree.store(it, std::memory_order_relaxed);
+            v = (uint64_t)(q100 + delta);
+        }
+    }
+    uint64_t last = clk_last.load(std::memory_order_relaxed);   // never step backwards
+    while (v > last && !clk_last.compare_exchange_weak(last, v, std::memory_order_relaxed)) {}
+    return v > last ? v : last;
 }
+static uint64_t now_ms() { return mono_100ns() / 10000ULL; }
 
 // seeded PRNG for session identifiers. rand() was never seeded, so every app
 // launch produced the SAME DACP-ID / SSRC / seq / rtptime (and rand()*rand()
@@ -187,18 +247,19 @@ static struct {
     std::atomic<bool>  beep_local{false};      // tick to PC output instead of stream
     std::atomic<int>   ap_latency_ms{150};     // AirPlay sender-side latency
     std::atomic<int>   ap_start_vol{-1};       // % at session start; -1 = leave alone
+    std::atomic<uint32_t> hw_capgap{0};        // worst capture gap this session (ms)
     std::atomic<uint64_t> beep_flash_ms{0};  // set by audio thread when a tick is injected
     // network
     CRITICAL_SECTION   cs;                   // guards clients
     std::vector<Client*> clients;
-    std::atomic<int>   http_port{16600};
+    std::atomic<int>   http_port{0};
     std::atomic<uint64_t> backlog_ms_x10{0}; // worst client backlog, tenths of ms
     // ui
     HWND hwnd = nullptr;
     HWND log = nullptr, cmb_dev = nullptr, cmb_fmt = nullptr, cmb_rate = nullptr,
          stat = nullptr, flash = nullptr, btn_scan = nullptr, btn_beep = nullptr,
          btn_localbeep = nullptr, cmb_aplat = nullptr,
-         sld_apvol = nullptr, lbl_apvol = nullptr;
+         sld_apvol = nullptr, lbl_apvol = nullptr, lbl_batt = nullptr;
     std::vector<Renderer> renderers;
     std::vector<std::wstring> dev_names;
     std::vector<std::wstring> dev_ids;
@@ -210,40 +271,134 @@ static struct {
 #define WM_APP_FLASH    (WM_APP + 3)   // metronome tick
 #define IDT_STATS       100
 #define IDT_FLASHOFF    101
+#define IDT_SHUTDOWN    102
+static bool g_closing = false;      // UI thread only
+static bool g_ui_preview = false;   // safe visual-QA mode: no audio/network/settings
 #define IDC_RENDER_BASE 2000
+#define IDC_BATTERY_ACK 3900
 
-static bool g_console_mode = false;
-static FILE* g_probe_file = nullptr;
-static FILE* g_sess_log = nullptr;          // persistent diagnostics: lowcast.log
-static CRITICAL_SECTION g_sess_log_cs;
+static std::atomic<bool> g_console_mode{false};
+static std::atomic<FILE*> g_probe_file{nullptr};
+static FILE* g_sess_log = nullptr;          // owned by the logging worker
+static CRITICAL_SECTION g_sess_log_cs;      // queue ONLY; never held over I/O
+static std::atomic<HWND> g_log_hwnd{nullptr};
+struct LogEntry { SYSTEMTIME time; wchar_t text[2048]; };
+static const size_t LOG_QUEUE_SIZE = 256;
+static LogEntry g_log_queue[LOG_QUEUE_SIZE];
+static size_t g_log_head = 0, g_log_count = 0;
+static std::atomic<uint64_t> g_log_dropped{0};
+static std::atomic<bool> g_log_accept{false}, g_log_stop{false};
+static HANDLE g_log_event = nullptr, g_log_thread = nullptr;
+
+static void log_write(const LogEntry& entry) {
+    const SYSTEMTIME& st = entry.time;
+    std::string u8 = wide_to_utf8(entry.text);
+    if (g_sess_log)
+        fprintf(g_sess_log, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                st.wMilliseconds, u8.c_str());
+    if (g_console_mode.load()) {
+        fwprintf(stdout, L"%ls\n", entry.text);
+        FILE* probe = g_probe_file.load();
+        if (probe) fprintf(probe, "%s\n", u8.c_str());
+    }
+    HWND hwnd = g_log_hwnd.load();
+    if (hwnd) {
+        std::wstring* msg = new std::wstring(entry.text);
+        if (!PostMessageW(hwnd, WM_APP_LOG, 0, (LPARAM)msg)) delete msg;
+    }
+}
+static DWORD WINAPI log_worker(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        WaitForSingleObject(g_log_event, 250);
+        // A bounded batch lets shutdown/drop reporting run even under a flood.
+        for (size_t i = 0; i < LOG_QUEUE_SIZE; ++i) {
+            LogEntry entry{};
+            EnterCriticalSection(&g_sess_log_cs);
+            bool have = g_log_count != 0;
+            if (have) {
+                entry = g_log_queue[g_log_head];
+                g_log_head = (g_log_head + 1) % LOG_QUEUE_SIZE;
+                --g_log_count;
+            }
+            LeaveCriticalSection(&g_sess_log_cs);
+            if (!have) break;
+            log_write(entry);
+        }
+        uint64_t dropped = g_log_dropped.exchange(0);
+        if (dropped) {
+            LogEntry entry{}; GetLocalTime(&entry.time);
+            swprintf(entry.text, 2048, L"[log] dropped %llu messages (queue busy/full); audio never waits for log I/O",
+                     (unsigned long long)dropped);
+            log_write(entry);
+        }
+        if (g_sess_log) fflush(g_sess_log);
+        if (g_console_mode.load()) {
+            fflush(stdout);
+            FILE* probe = g_probe_file.load();
+            if (probe) fflush(probe);
+        }
+        EnterCriticalSection(&g_sess_log_cs);
+        bool empty = g_log_count == 0;
+        LeaveCriticalSection(&g_sess_log_cs);
+        if (g_log_stop.load() && empty) break;
+        if (!empty) SetEvent(g_log_event);
+    }
+    if (g_sess_log) { fclose(g_sess_log); g_sess_log = nullptr; }
+    return 0;
+}
 static void sess_log_open() {
     InitializeCriticalSection(&g_sess_log_cs);
     wchar_t path[MAX_PATH];
     DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    while (n > 0 && path[n - 1] != L'\\') --n;
-    wcscpy_s(path + n, MAX_PATH - n, L"lowcast.log");
-    g_sess_log = _wfopen(path, L"a");
+    if (n && n < MAX_PATH) {
+        while (n > 0 && path[n - 1] != L'\\') --n;
+        if (wcscpy_s(path + n, MAX_PATH - n, L"lowcast.log") == 0)
+            g_sess_log = _wfopen(path, L"a");
+    }
+    g_log_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_log_event) g_log_thread = CreateThread(nullptr, 0, log_worker, nullptr, 0, nullptr);
+    if (g_log_thread) g_log_accept.store(true);
+    else {
+        if (g_sess_log) { fclose(g_sess_log); g_sess_log = nullptr; }
+        if (g_log_event) { CloseHandle(g_log_event); g_log_event = nullptr; }
+        OutputDebugStringW(L"LowCast: async logger could not start; file logging disabled\n");
+    }
+}
+static void sess_log_close() {
+    // UI/main-thread cleanup only. Leave process-lifetime queue objects intact:
+    // detached discovery/battery workers may finish a late log call on exit.
+    g_log_accept.store(false);
+    EnterCriticalSection(&g_sess_log_cs);
+    g_log_stop.store(true);
+    LeaveCriticalSection(&g_sess_log_cs);
+    if (g_log_event) SetEvent(g_log_event);
+    if (g_log_thread && WaitForSingleObject(g_log_thread, 2000) == WAIT_OBJECT_0) {
+        CloseHandle(g_log_thread); g_log_thread = nullptr;
+    }
+    // On a stuck storage write do not close FILE/event beneath the worker.
 }
 static void ui_log(const std::wstring& msg) {
-    if (g_sess_log) {
-        SYSTEMTIME st; GetLocalTime(&st);
-        std::string u8 = wide_to_utf8(msg);
-        EnterCriticalSection(&g_sess_log_cs);
-        fprintf(g_sess_log, "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\n",
-                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                st.wMilliseconds, u8.c_str());
-        fflush(g_sess_log);
+    if (!g_log_accept.load()) return;
+    SYSTEMTIME time; GetLocalTime(&time);      // event time, not disk-write time
+    if (!TryEnterCriticalSection(&g_sess_log_cs)) {
+        g_log_dropped.fetch_add(1); return;
+    }
+    if (!g_log_accept.load()) { LeaveCriticalSection(&g_sess_log_cs); return; }
+    if (g_log_count == LOG_QUEUE_SIZE) {
         LeaveCriticalSection(&g_sess_log_cs);
+        g_log_dropped.fetch_add(1); return;
     }
-    if (g_console_mode) {
-        fwprintf(stdout, L"%ls\n", msg.c_str()); fflush(stdout);
-        if (g_probe_file) {
-            std::string u8 = wide_to_utf8(msg);
-            fprintf(g_probe_file, "%s\n", u8.c_str()); fflush(g_probe_file);
-        }
-    }
-    if (!G.hwnd) return;
-    PostMessageW(G.hwnd, WM_APP_LOG, 0, (LPARAM)new std::wstring(msg));
+    LogEntry& entry = g_log_queue[(g_log_head + g_log_count) % LOG_QUEUE_SIZE];
+    entry.time = time;
+    size_t len = msg.size() < 2047 ? msg.size() : 2047;
+    memcpy(entry.text, msg.data(), len * sizeof(wchar_t));
+    entry.text[len] = 0;
+    if (msg.size() > len) { entry.text[len - 3] = L'.'; entry.text[len - 2] = L'.'; entry.text[len - 1] = L'.'; }
+    ++g_log_count;
+    LeaveCriticalSection(&g_sess_log_cs);
+    SetEvent(g_log_event);
 }
 static void ui_log8(const std::string& msg) { ui_log(utf8_to_wide(msg)); }
 
@@ -344,7 +499,8 @@ struct Encoder {
 };
 
 static void raop_pipe_push(float l, float r);
-static void raop_send_volume_pct(int vp);    // one RAOP volume command, guarded
+static void raop_send_volume_pct(int vp, bool logit = true);   // one guarded RAOP volume cmd
+static int  raop_suggested_floor_ms();       // measured min buffer; -1 if no session
 static void raop_push_volume(int pct);       // queue a volume for the live session
 static bool raop_is_running();
 static void raop_stats(double& secs_sent, double& hb_age_s, unsigned long long& resends,
@@ -355,8 +511,18 @@ DEFINE_GUID(IID_IAudioClient3_L, 0x7ED4EE07, 0x8E67, 0x4CD4,
 DEFINE_GUID(IID_IAudioRenderClient_L2, 0xF294ACFC, 0x3146, 0x4483,
             0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2);
 
-static std::atomic<bool> g_period_driver_run{false};
-struct PeriodDriverArgs { IMMDevice* dev; };
+static std::atomic<int>  g_cap_relaunches{0};      // capture relaunches since the last real packet
+static std::atomic<uint32_t> g_capture_gen{0};
+struct CaptureContext {
+    uint32_t generation;
+    HANDLE stop;
+    bool retry = false;                          // owned by the capture thread
+};
+static bool capture_active(const CaptureContext* ctx) {
+    return G.capture_run.load() && g_capture_gen.load() == ctx->generation &&
+           WaitForSingleObject(ctx->stop, 0) == WAIT_TIMEOUT;
+}
+struct PeriodDriverArgs { IMMDevice* dev; HANDLE stop; HANDLE capture_stop; };
 
 // Keeps a minimum-period silent render stream open on the capture device so
 // the shared audio engine ticks at its fastest rate -> loopback delivers
@@ -365,6 +531,7 @@ static DWORD WINAPI period_driver_thread(LPVOID p) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     PeriodDriverArgs* a = (PeriodDriverArgs*)p;
     IMMDevice* dev = a->dev;
+    HANDLE stop = a->stop, capture_stop = a->capture_stop;
     delete a;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IAudioClient3* ac3 = nullptr;
@@ -382,10 +549,13 @@ static DWORD WINAPI period_driver_thread(LPVOID p) {
                                                       mn, wf, nullptr);
         if (FAILED(hr)) { ui_log(L"[audio] low-period stream rejected by driver"); break; }
         evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        ac3->SetEventHandle(evt);
+        if (!evt || FAILED(ac3->SetEventHandle(evt))) break;
         if (FAILED(ac3->GetService(IID_IAudioRenderClient_L2, (void**)&rc))) break;
-        UINT32 bufsz = 0; ac3->GetBufferSize(&bufsz);
-        ac3->Start();
+        UINT32 bufsz = 0;
+        if (FAILED(ac3->GetBufferSize(&bufsz))) break;
+        if (WaitForSingleObject(stop, 0) != WAIT_TIMEOUT ||
+            WaitForSingleObject(capture_stop, 0) != WAIT_TIMEOUT) break;
+        if (FAILED(ac3->Start())) break;
         {
             wchar_t b[160];
             swprintf(b, 160, L"[audio] engine period driver active: %u -> %u frames "
@@ -393,9 +563,12 @@ static DWORD WINAPI period_driver_thread(LPVOID p) {
                      mn * 1000.0 / wf->nSamplesPerSec);
             ui_log(b);
         }
-        while (g_period_driver_run.load()) {
-            WaitForSingleObject(evt, 20);
-            UINT32 pad = 0; ac3->GetCurrentPadding(&pad);
+        HANDLE waits[] = { stop, capture_stop, evt };
+        for (;;) {
+            DWORD wake = WaitForMultipleObjects(3, waits, FALSE, 20);
+            if (wake == WAIT_OBJECT_0 || wake == WAIT_OBJECT_0 + 1 || wake == WAIT_FAILED) break;
+            UINT32 pad = 0;
+            if (FAILED(ac3->GetCurrentPadding(&pad)) || pad > bufsz) break;
             UINT32 want = bufsz - pad;
             if (!want) continue;
             BYTE* out = nullptr;
@@ -413,8 +586,31 @@ static DWORD WINAPI period_driver_thread(LPVOID p) {
     CoUninitialize();
     return 0;
 }
-static void raop_start(const std::string& host, int port, uint32_t latency_ms);
-static void raop_stop();
+// The capture worker owns and joins its period worker, including failed-open
+// paths. Cancellation events are never reset/reused by a replacement session.
+struct PeriodDriver {
+    HANDLE thread = nullptr, stop = nullptr;
+    void start(IMMDevice* dev, HANDLE capture_stop) {
+        stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!stop) return;
+        dev->AddRef();
+        PeriodDriverArgs* args = new PeriodDriverArgs{ dev, stop, capture_stop };
+        thread = CreateThread(nullptr, 0, period_driver_thread, args, 0, nullptr);
+        if (!thread) { dev->Release(); delete args; CloseHandle(stop); stop = nullptr; }
+    }
+    ~PeriodDriver() {
+        if (stop) SetEvent(stop);
+        if (thread) {
+            // Background cleanup may wait on a driver. The UI keeps the capture
+            // handle on its bounded join timeout and refuses overlapping starts.
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+        }
+        if (stop) CloseHandle(stop);
+    }
+};
+static bool raop_start(const std::string& host, int port, uint32_t latency_ms);
+static bool raop_stop(bool wait_full = false);
 static void raop_resolve();
 
 // DMX_BEGIN
@@ -468,14 +664,50 @@ static void build_downmix(uint32_t mask, int ch, float* cl, float* cr) {
 }
 // DMX_END
 
-static DWORD WINAPI capture_thread(LPVOID) {
+// Reopen on the same owned capture thread. Both GUI and console modes retain
+// one join handle; no exiting worker publishes a replacement handle.
+static void capture_schedule_relaunch(CaptureContext* ctx) {
+    if (!capture_active(ctx)) return;
+    int n = g_cap_relaunches.fetch_add(1);
+    DWORD back = 150u << (n < 5 ? n : 5);            // ~200 ms, 300, 600 ... 4.8 s
+    if (WaitForSingleObject(ctx->stop, back) == WAIT_TIMEOUT && capture_active(ctx))
+        ctx->retry = true;
+}
+// Open-time failure. On a relaunch (device flapping after DEVICE_INVALIDATED or
+// a driver reset) keep retrying with backoff; on a first start report and stop.
+static void capture_open_failed(CaptureContext* ctx) {
+    if (!capture_active(ctx)) return;
+    if (g_cap_relaunches.load() > 0) capture_schedule_relaunch(ctx);
+    else G.capture_run.store(false);
+}
+
+static bool capture_source_format(const WAVEFORMATEX* wf, bool& is_float,
+                                  int& bits, int& channels, uint32_t& mask) {
+    if (!wf || !wf->nSamplesPerSec || !wf->nChannels) return false;
+    bits = wf->wBitsPerSample; channels = wf->nChannels; mask = 0;
+    is_float = wf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
+    bool pcm = wf->wFormatTag == WAVE_FORMAT_PCM;
+    if (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        if (wf->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) return false;
+        const WAVEFORMATEXTENSIBLE* we = (const WAVEFORMATEXTENSIBLE*)wf;
+        is_float = IsEqualGUID(we->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT_L);
+        pcm = IsEqualGUID(we->SubFormat, KSDATAFORMAT_SUBTYPE_PCM_L);
+        mask = we->dwChannelMask;
+    }
+    if (!(is_float ? bits == 32 : pcm && (bits == 16 || bits == 24 || bits == 32))) return false;
+    return wf->nBlockAlign >= channels * (bits / 8);
+}
+
+static DWORD capture_attempt(CaptureContext* ctx) {
+    if (!capture_active(ctx)) return 0;
+    PeriodDriver period_driver;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IMMDeviceEnumerator* denum = nullptr;
     HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator_L, nullptr, CLSCTX_ALL,
                                   IID_IMMDeviceEnumerator_L, (void**)&denum);
     if (FAILED(hr)) { ui_log(L"[audio] device enumerator failed");
-                      G.capture_run.store(false); CoUninitialize(); return 1; }
+                      capture_open_failed(ctx); CoUninitialize(); return 1; }
 
     IMMDevice* dev = nullptr;
     int idx = G.capture_dev.load();
@@ -485,18 +717,14 @@ static DWORD WINAPI capture_thread(LPVOID) {
     else
         hr = denum->GetDefaultAudioEndpoint(eRender, eConsole, &dev);
     if (FAILED(hr) || !dev) { ui_log(L"[audio] cannot open capture device");
-                              denum->Release(); G.capture_run.store(false);
+                              denum->Release(); capture_open_failed(ctx);
                               CoUninitialize(); return 1; }
     // remember which endpoint we're on so we can notice if the default moves
     std::wstring opened_id;
     { LPWSTR wid = nullptr; if (SUCCEEDED(dev->GetId(&wid)) && wid) { opened_id = wid; CoTaskMemFree(wid); } }
 
-    // spin up the engine-period driver on this device (AddRef'd handle)
-    if (!g_period_driver_run.exchange(true)) {
-        dev->AddRef();
-        PeriodDriverArgs* pda = new PeriodDriverArgs{ dev };
-        CloseHandle(CreateThread(nullptr, 0, period_driver_thread, pda, 0, nullptr));
-    }
+    if (!capture_active(ctx)) { dev->Release(); denum->Release(); CoUninitialize(); return 0; }
+    period_driver.start(dev, ctx->stop);
 
     IAudioClient* ac = nullptr;
     hr = dev->Activate(IID_IAudioClient_L, CLSCTX_ALL, nullptr, (void**)&ac);
@@ -506,27 +734,13 @@ static DWORD WINAPI capture_thread(LPVOID) {
         ui_log(L"[audio] mix format failed");
         if (ac) ac->Release();
         dev->Release(); denum->Release();
-        G.capture_run.store(false); CoUninitialize(); return 1;
+        capture_open_failed(ctx); CoUninitialize(); return 1;
     }
 
-    bool src_float = false; int src_bits = wf->wBitsPerSample; int src_ch = wf->nChannels;
-    if (wf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) src_float = true;
-    else if (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-        WAVEFORMATEXTENSIBLE* we = (WAVEFORMATEXTENSIBLE*)wf;
-        src_float = IsEqualGUID(we->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT_L);
+    if (!capture_active(ctx)) {
+        CoTaskMemFree(wf); ac->Release(); dev->Release(); denum->Release();
+        CoUninitialize(); return 0;
     }
-    G.native_rate.store(wf->nSamplesPerSec);
-    G.measured_rate.store((double)wf->nSamplesPerSec);
-    {
-        // If the advertised rate changed (device switch, e.g. 44.1k -> 48k
-        // headset), streams negotiated at the OLD rate would now play at the
-        // wrong speed/pitch. Close them like the format-change path does.
-        uint32_t adv = wf->nSamplesPerSec * (uint32_t)G.upmult.load();
-        uint32_t old = G.sample_rate.exchange(adv);
-        if (old != adv && kill_all_clients() > 0)
-            ui_log(L"[audio] stream rate changed \x2014 active streams closed; press START again");
-    }
-
     // Event-driven loopback: the smallest shared-mode buffer Windows allows,
     // and we wake the instant audio is ready rather than polling on a timer.
     // (Loopback REQUIRES shared mode — exclusive mode cannot capture the system
@@ -551,6 +765,14 @@ static DWORD WINAPI capture_thread(LPVOID) {
     } else {
         ui_log(L"[audio] event-driven capture active");
     }
+    // Reactivation above can return a different mix format. Decode and publish
+    // only this final format, never metadata from the failed event-mode client.
+    bool src_float = false; int src_bits = 0, src_ch = 0;
+    uint32_t chmask = 0;
+    if (SUCCEEDED(hr) && !capture_source_format(wf, src_float, src_bits, src_ch, chmask)) {
+        ui_log(L"[audio] unsupported or malformed capture mix format");
+        hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+    }
     IAudioCaptureClient* cap = nullptr;
     if (SUCCEEDED(hr)) hr = ac->GetService(IID_IAudioCaptureClient_L, (void**)&cap);
     if (SUCCEEDED(hr)) hr = ac->Start();
@@ -561,12 +783,26 @@ static DWORD WINAPI capture_thread(LPVOID) {
         if (wf) CoTaskMemFree(wf);
         if (audio_evt) CloseHandle(audio_evt);
         dev->Release(); denum->Release();
-        G.capture_run.store(false); CoUninitialize(); return 1;
+        capture_open_failed(ctx); CoUninitialize(); return 1;
+    }
+
+    if (!capture_active(ctx)) {
+        ac->Stop(); cap->Release(); ac->Release(); CoTaskMemFree(wf);
+        if (audio_evt) CloseHandle(audio_evt);
+        dev->Release(); denum->Release(); CoUninitialize(); return 0;
+    }
+    G.native_rate.store(wf->nSamplesPerSec);
+    G.measured_rate.store((double)wf->nSamplesPerSec);
+    {
+        uint32_t adv = wf->nSamplesPerSec * (uint32_t)G.upmult.load();
+        uint32_t old = G.sample_rate.exchange(adv);
+        if (old != adv && kill_all_clients() > 0)
+            ui_log(L"[audio] stream rate changed \x2014 active streams closed; press START again");
     }
 
     {
         wchar_t buf[128];
-        swprintf(buf, 128, L"[audio] capturing: %u Hz, %d ch, %s%d-bit source",
+        swprintf(buf, 128, L"[audio] capturing: %u Hz, %d ch, %ls%d-bit source",
                  wf->nSamplesPerSec, src_ch, src_float ? L"float " : L"", src_bits);
         ui_log(buf);
     }
@@ -575,9 +811,6 @@ static DWORD WINAPI capture_thread(LPVOID) {
     const int  mult = G.upmult.load();             // linear-interp upsampling
     const int src_bpf = wf->nBlockAlign;
     // stereo downmix coefficients for ALL source channels (see build_downmix)
-    uint32_t chmask = 0;
-    if (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wf->cbSize >= 22)
-        chmask = ((WAVEFORMATEXTENSIBLE*)wf)->dwChannelMask;
     float dmx_l[32] = {0}, dmx_r[32] = {0};
     int dmx_ch = src_ch > 32 ? 32 : src_ch;
     build_downmix(chmask, dmx_ch, dmx_l, dmx_r);
@@ -633,8 +866,9 @@ static DWORD WINAPI capture_thread(LPVOID) {
     uint64_t meas_t0 = 0, meas_frames0 = 0, real_frame_count = 0;
     // [diag] capture health counters, reported every 10 s (read-only telemetry)
     uint64_t dg_pkts = 0, dg_disc = 0, dg_gapmax = 0, dg_lastpkt = 0, dg_fill = 0;
+    bool dg_idle = false;   // silence-fill fired since the last real packet
     uint64_t dg_next = now_ms() + 10000;
-    while (G.capture_run.load()) {
+    while (capture_active(ctx)) {
         // detect a default-output switch (e.g. user changes Windows output device)
         if (following_default && now_ms() - last_devcheck > 500) {
             last_devcheck = now_ms();
@@ -659,15 +893,32 @@ static DWORD WINAPI capture_thread(LPVOID) {
         UINT32 pkt = 0;
         bool got_real = false;
         uint64_t got_real_frames = 0;
-        while (SUCCEEDED(cap->GetNextPacketSize(&pkt)) && pkt > 0) {
+        HRESULT chr = S_OK;
+        while (SUCCEEDED(chr = cap->GetNextPacketSize(&pkt)) && pkt > 0) {
             got_real = true;
             BYTE* data = nullptr; UINT32 frames = 0; DWORD flags = 0;
-            if (FAILED(cap->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
+            if (FAILED(chr = cap->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
             bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
             dg_pkts++;
             if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) dg_disc++;   // WASAPI glitched
             { uint64_t nn = now_ms();
-              if (dg_lastpkt && nn - dg_lastpkt > dg_gapmax) dg_gapmax = nn - dg_lastpkt;
+              if (dg_lastpkt) {
+                  uint64_t g = nn - dg_lastpkt;
+                  if (dg_idle) {
+                      // The gap spans a silence-fill stretch: WASAPI delivers
+                      // nothing while NO app renders, so this measures "game
+                      // was quiet", not "Windows stalled" (field case: an
+                      // 18.8s idle recorded as cap gap poisoned the floor for
+                      // 5.5 hours). Real stalls freeze this thread entirely,
+                      // so no fill runs during them and they still record.
+                      dg_idle = false;
+                  } else {
+                      if (g > dg_gapmax) dg_gapmax = g;
+                      uint32_t hw = G.hw_capgap.load();
+                      if (g < 2000 && g > hw)   // sleep/freeze-class events are
+                          G.hw_capgap.store((uint32_t)g);   // not schedulable
+                  }                                         // jitter either
+              }
               dg_lastpkt = nn; }
             for (UINT32 i = 0; i < frames; ++i) {
                 float l = 0.f, r = 0.f;
@@ -693,13 +944,25 @@ static DWORD WINAPI capture_thread(LPVOID) {
             got_real_frames += frames;
             cap->ReleaseBuffer(frames);
         }
+        if (FAILED(chr)) {
+            // AUDCLNT_E_DEVICE_INVALIDATED (format change in Sound settings,
+            // driver restart, device removed) used to be folded into "no data":
+            // capture degraded to permanent silence fill with no log line. Treat
+            // any capture-client failure as a device change and reopen.
+            wchar_t ce[96];
+            swprintf(ce, 96, L"[audio] capture client failed (hr=0x%08lX) \x2014 reopening device",
+                     (unsigned long)chr);
+            ui_log(ce);
+            device_changed = true;
+            break;
+        }
 
         // 2) wall-clock silence fill: if nothing is playing, WASAPI delivers no
         //    packets, but the renderer must keep receiving realtime audio or it
         //    stalls and re-buffers (adding latency back). Keep it fed.
         //    Re-anchor the clock whenever real audio flows so soundcard-vs-QPC
         //    drift can never accumulate into an audible mid-music gap.
-        if (got_real) t0 = now_ms() - total_frames * 1000ULL / rate;
+        if (got_real) { t0 = now_ms() - total_frames * 1000ULL / rate; g_cap_relaunches.store(0); }
 
         // measure the soundcard's TRUE sample rate over a long window: real frames
         // delivered by WASAPI vs wall-clock elapsed. This is the ppm-accurate rate
@@ -721,7 +984,39 @@ static DWORD WINAPI capture_thread(LPVOID) {
             }
         }
         uint64_t expected = (now_ms() - t0) * rate / 1000ULL;
-        if (expected > total_frames + rate / 50) {                // >20 ms behind
+        if (expected > total_frames + rate / 2) {
+            // > 500 ms behind = the process/system was frozen or asleep, not
+            // "nothing is playing". Replaying that deficit as silence blasted it
+            // at ~45x realtime in 250 ms bursts (TRIM storm, poisoned floor
+            // telemetry, receiver/HTTP flood) for audio the receiver could never
+            // use. Drop the deficit and re-anchor to what was actually produced.
+            uint64_t deficit = expected - total_frames;
+            uint64_t lost_ms = deficit * 1000ULL / rate;
+            // DLNA/HTTP clients consume a byte stream and keep their buffer
+            // margin only if the timeline stays continuous: hand them the
+            // deficit as silence but keep it OUT of the RAOP pipe, where
+            // old-timestamped frames would only be trimmed. Capped at 1 s:
+            // one fanout() push above ~4 MB (MAX_CLIENT_BACKLOG) would drop
+            // the client instead (3 s at 4x/24-bit is 3.5 MB).
+            uint64_t http_fill = deficit > (uint64_t)rate ? (uint64_t)rate : deficit;
+            for (uint64_t i = 0; i < http_fill; ++i) { float zl = 0.f, zr = 0.f; emit(zl, zr); }
+            t0 = now_ms() - total_frames * 1000ULL / rate;
+            expected = total_frames;
+            meas_t0 = 0;                                          // window invalid
+            wchar_t fz[144];
+            swprintf(fz, 144, L"[audio] capture clock jumped %llu ms (freeze/sleep) "
+                              L"\x2014 re-anchored; AirPlay deficit dropped, DLNA fed <=1 s silence",
+                     (unsigned long long)lost_ms);
+            ui_log(fz);
+        }
+        // Threshold 50 ms (was 20 = two engine periods). A late WASAPI delivery
+        // is not silence: at 20 ms a routine 25 ms hiccup spliced ~23 ms of zeros
+        // INTO continuous audio and the delayed content then landed on top of
+        // it. Log histogram: routine delivery gaps <= 32 ms. The receiver absorbs
+        // an in-order sender stall of up to ~200 ms (it waits on an empty ring
+        // with its DAC cushion intact), so a later first fill at silence onset
+        // costs nothing audible.
+        if (expected > total_frames + rate / 20) {                // >50 ms behind
             uint64_t fill = expected - total_frames;
             if (fill > rate / 4) fill = rate / 4;                 // cap 250 ms burst
             for (uint64_t i = 0; i < fill; ++i) {
@@ -733,6 +1028,7 @@ static DWORD WINAPI capture_thread(LPVOID) {
             }
             G.silence_frames.fetch_add(fill);
             dg_fill += fill;
+            dg_idle = true;
             // A window containing wall-clock fill has real frames MISSING from
             // it: a sub-2% pause (e.g. 70 ms in 4 s) passes the sanity clamp
             // with a rate up to 2% low — 20,000 ppm of error against a servo
@@ -746,13 +1042,19 @@ static DWORD WINAPI capture_thread(LPVOID) {
             G.frames_captured.store(total_frames);
         }
         if (now_ms() >= dg_next) {                       // [diag] 10 s capture report
-            wchar_t db[160];
-            swprintf(db, 160, L"[diag] cap: pkts=%llu disc=%llu maxgap=%llums fill=%llums",
-                     (unsigned long long)dg_pkts, (unsigned long long)dg_disc,
-                     (unsigned long long)dg_gapmax,
-                     (unsigned long long)(dg_fill * 1000 / rate));
-            ui_log(db);
-            dg_pkts = dg_disc = dg_gapmax = dg_fill = 0;
+            bool consumers;                              // anyone actually listening?
+            EnterCriticalSection(&G.cs);
+            consumers = !G.clients.empty();
+            LeaveCriticalSection(&G.cs);
+            if (consumers || raop_is_running()) {        // idle telemetry is just noise
+                wchar_t db[160];
+                swprintf(db, 160, L"[diag] cap: pkts=%llu disc=%llu maxgap=%llums fill=%llums",
+                         (unsigned long long)dg_pkts, (unsigned long long)dg_disc,
+                         (unsigned long long)dg_gapmax,
+                         (unsigned long long)(dg_fill * 1000 / rate));
+                ui_log(db);
+            }
+            dg_pkts = dg_disc = dg_gapmax = dg_fill = 0;  // window resets either way
             dg_next += 10000;
         }
         if (event_mode) WaitForSingleObject(audio_evt, 5);   // wake on audio-ready
@@ -763,18 +1065,17 @@ static DWORD WINAPI capture_thread(LPVOID) {
     if (audio_evt) CloseHandle(audio_evt);
     cap->Release(); ac->Release(); CoTaskMemFree(wf); dev->Release(); denum->Release();
     CoUninitialize();
-    // seamless follow: if the default device moved (not a user Stop), the engine
-    // period driver is tied to the old device, so retire it and relaunch capture.
-    if (device_changed && G.capture_run.load()) {
-        g_period_driver_run.store(false);
-        Sleep(150);
-        extern HANDLE g_capture_handle;
-        HANDLE nh = CreateThread(nullptr, 0, capture_thread, nullptr, 0, nullptr);
-        HANDLE old = g_capture_handle;
-        g_capture_handle = nh;
-        if (old) CloseHandle(old);   // release the (now-exiting) prior handle
-    }
+    if (device_changed) capture_schedule_relaunch(ctx);
     return 0;
+}
+static DWORD WINAPI capture_thread(LPVOID param) {
+    CaptureContext* ctx = (CaptureContext*)param;
+    DWORD result;
+    do {
+        ctx->retry = false;
+        result = capture_attempt(ctx);           // also joins this attempt's period worker
+    } while (ctx->retry && capture_active(ctx));
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -973,14 +1274,17 @@ static DWORD WINAPI local_beep_thread(LPVOID) {
 
 static DWORD WINAPI http_server_thread(LPVOID) {
     SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET) { ui_log(L"[http] cannot create server socket"); return 1; }
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY;
     int port = 16600;
+    bool bound = false;
     for (; port < 16620; ++port) {
         a.sin_port = htons((u_short)port);
-        if (bind(ls, (sockaddr*)&a, sizeof(a)) == 0) break;
+        if (bind(ls, (sockaddr*)&a, sizeof(a)) == 0) { bound = true; break; }
     }
+    if (!bound) { closesocket(ls); ui_log(L"[http] ports 16600-16619 are unavailable"); return 1; }
+    if (listen(ls, 8) != 0) { closesocket(ls); ui_log(L"[http] listen failed"); return 1; }
     G.http_port.store(port);
-    listen(ls, 8);
     {
         wchar_t b[96]; swprintf(b, 96, L"[http] server listening on port %d", port);
         ui_log(b);
@@ -988,8 +1292,13 @@ static DWORD WINAPI http_server_thread(LPVOID) {
     for (;;) {
         SOCKET cs = accept(ls, nullptr, nullptr);
         if (cs == INVALID_SOCKET) break;
-        CloseHandle(CreateThread(nullptr, 0, client_thread, (LPVOID)(uintptr_t)cs, 0, nullptr));
+        HANDLE worker = CreateThread(nullptr, 0, client_thread, (LPVOID)(uintptr_t)cs, 0, nullptr);
+        if (worker) CloseHandle(worker);
+        else closesocket(cs);
     }
+    closesocket(ls);
+    int expected = port;
+    G.http_port.compare_exchange_strong(expected, 0);
     return 0;
 }
 
@@ -1075,20 +1384,23 @@ static std::string http_get(const std::string& url) {
 // local IP used to reach a given renderer host (handles multi-NIC correctly)
 static std::string local_ip_for(const std::string& target_host) {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return {};
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(9);
     if (inet_pton(AF_INET, target_host.c_str(), &a.sin_addr) != 1) {
         addrinfo hints{}, *res = nullptr; hints.ai_family = AF_INET;
-        if (getaddrinfo(target_host.c_str(), nullptr, &hints, &res) == 0 && res) {
-            a.sin_addr = ((sockaddr_in*)res->ai_addr)->sin_addr;
-            freeaddrinfo(res);
+        if (getaddrinfo(target_host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+            closesocket(s); return {};
         }
+        a.sin_addr = ((sockaddr_in*)res->ai_addr)->sin_addr;
+        freeaddrinfo(res);
     }
-    connect(s, (sockaddr*)&a, sizeof(a));
+    if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(s); return {}; }
     sockaddr_in me{}; int ml = sizeof(me);
-    getsockname(s, (sockaddr*)&me, &ml);
+    if (getsockname(s, (sockaddr*)&me, &ml) != 0) { closesocket(s); return {}; }
+    char ip[64]{};
+    bool converted = inet_ntop(AF_INET, &me.sin_addr, ip, sizeof(ip)) != nullptr;
     closesocket(s);
-    char ip[64]; inet_ntop(AF_INET, &me.sin_addr, ip, sizeof(ip));
-    return ip;
+    return converted ? std::string(ip) : std::string();
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1469,7 @@ static void ssdp_discover() {
         }
         socks.push_back(s);
     }
+    if (socks.empty()) { ui_log(L"[ssdp] cannot create a discovery socket on any interface"); return; }
 
     std::vector<std::string> locations;
     uint64_t start = now_ms();
@@ -1203,7 +1516,7 @@ static void ssdp_discover() {
         }
         // walk each <service> block; a block may list controlURL BEFORE
         // serviceType (order is not guaranteed by UPnP), so match per-block.
-        std::string ctrl, oh_ctrl, cm_ctrl;
+        std::string ctrl, oh_ctrl, cm_ctrl, svc_inventory;
         size_t pos = 0;
         while (true) {
             size_t sb = ifind(xml, "<service>", pos);
@@ -1213,6 +1526,13 @@ static void ssdp_discover() {
             std::string block = xml.substr(sb, se - sb);
             pos = se + 10;
             std::string type = xml_tag(block, "serviceType");
+            if (!type.empty()) {                 // full inventory for the log:
+                std::string shortt = type;       // vendor-custom services (a
+                size_t u = shortt.rfind("service:");   // battery/status API?)
+                if (u != std::string::npos) shortt = shortt.substr(u + 8);
+                if (!svc_inventory.empty()) svc_inventory += ", ";
+                svc_inventory += shortt;
+            }
             if (ifind(type, "urn:schemas-upnp-org:service:AVTransport") != std::string::npos
                 && ctrl.empty())
                 ctrl = xml_tag(block, "controlURL");
@@ -1254,6 +1574,8 @@ static void ssdp_discover() {
             ui_log8("[ssdp]   OpenHome Playlist control: " + r.oh_url + "  (preferred)");
         if (!r.control_url.empty())
             ui_log8("[ssdp]   AVTransport control: " + r.control_url);
+        if (!svc_inventory.empty())
+            ui_log8("[ssdp]   services: " + svc_inventory);
         // dedup (a device can answer several STs / interfaces)
         bool dup = false;
         for (auto& f2 : found)
@@ -1281,8 +1603,11 @@ static SOCKET mdns_listener();
 static void mdns_sweep() {
     ui_log(L"[mdns] sweeping for AirPlay/Chromecast/realtime services (2 s)...");
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) { ui_log(L"[mdns] cannot create discovery socket"); return; }
     sockaddr_in ba{}; ba.sin_family = AF_INET; ba.sin_addr.s_addr = INADDR_ANY;
-    bind(s, (sockaddr*)&ba, sizeof(ba));
+    if (bind(s, (sockaddr*)&ba, sizeof(ba)) != 0) {
+        closesocket(s); ui_log(L"[mdns] cannot bind discovery socket"); return;
+    }
     DWORD tmo = 300;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
     int ttl = 4;
@@ -1346,8 +1671,11 @@ static bool soap_post_url(const std::string& control_url, const std::string& soa
                           const std::string& body, std::string* out_resp = nullptr) {
     Url u; if (!parse_url(control_url, u)) return false;
     const char* action = soapaction.c_str();
-    // header set and order mirror swyh-rs (ureq) byte-for-byte: some embedded
-    // SOAP stacks are irrationally picky, so match a client known to work.
+    // header set and order mirror swyh-rs (ureq), plus "Connection: close":
+    // http_request has no chunked-terminator detection, so a keep-alive peer
+    // answering chunked would otherwise cost the 5 s socket timeout per call.
+    // Some embedded SOAP stacks are irrationally picky, so otherwise match a
+    // client known to work.
     char hdr[1024];
     snprintf(hdr, sizeof(hdr),
              "POST %s HTTP/1.1\r\n"
@@ -1356,6 +1684,7 @@ static bool soap_post_url(const std::string& control_url, const std::string& soa
              "Accept: */*\r\n"
              "SOAPAction: \"%s\"\r\n"
              "Content-Type: text/xml; charset=\"utf-8\"\r\n"
+             "Connection: close\r\n"
              "Content-Length: %zu\r\n\r\n",
              u.path.c_str(), u.host.c_str(), u.port, action, body.size());
     std::string resp;
@@ -1404,9 +1733,18 @@ static const char* OH_DELETE_BODY =
 
 static bool try_cast_format(Renderer& r, Fmt f) {
     uint32_t rate = G.sample_rate.load();
+    int http_port = G.http_port.load();
+    if (http_port <= 0) {
+        ui_log(L"[upnp] local stream server is unavailable");
+        return false;
+    }
     std::string ip = local_ip_for(r.host);
+    if (ip.empty()) {
+        ui_log8("[upnp] cannot determine the local address used to reach " + r.host);
+        return false;
+    }
     char uri[256];
-    snprintf(uri, sizeof(uri), "http://%s:%d/stream.%s", ip.c_str(), G.http_port.load(),
+    snprintf(uri, sizeof(uri), "http://%s:%d/stream.%s", ip.c_str(), http_port,
              fmt_is_wav(f) ? "wav" : "pcm");
 
     // protocolInfo strings per swyh-rs
@@ -1584,9 +1922,27 @@ static bool start_cast(Renderer& r) {
     }
     ui_log8(std::string("[upnp] renderer rejected ") + (fmt_is_wav(sel) ? "WAV" : "LPCM")
             + " — retrying as WAV " + (fmt_bits(alt) == 24 ? "24" : "16") + "-bit");
-    if (!try_cast_format(r, alt)) return false;
+    // The format is process-global: switch it BEFORE the renderer's GET can
+    // arrive, and end any client still streaming the old format first (as the
+    // manual dropdown path does), or a live client gets an endianness /
+    // container flip mid-stream.
+    // (That includes this renderer's own first-attempt client, which carries
+    // the rejected format.)
+    if (kill_all_clients() > 0)
+        ui_log(L"[upnp] active streams closed for the format fallback \x2014 press START on other renderers again");
     G.fmt.store((int)alt);                       // HTTP server must serve what we promised
     PostMessageW(G.hwnd, WM_APP_RENDERS, 2, 0);  // sync the format dropdown
+    if (!try_cast_format(r, alt)) {
+        // Rejected too. The renderer may have pre-fetched the stream during
+        // SetAVTransportURI, so end it BEFORE flipping the format back, and
+        // restore only if nobody changed the dropdown while the SOAP calls
+        // were in flight (start_cast runs on a worker thread outside G.cs).
+        kill_all_clients();
+        int e = (int)alt;
+        if (G.fmt.compare_exchange_strong(e, (int)sel))
+            PostMessageW(G.hwnd, WM_APP_RENDERS, 3, 0);   // "fallback rejected"
+        return false;
+    }
     return true;
 }
 
@@ -1645,63 +2001,94 @@ static void enum_render_devices() {
 // Capture restart (device/format change)
 // ---------------------------------------------------------------------------
 HANDLE g_capture_handle = nullptr;
-static void stop_capture() {
-    g_period_driver_run.store(false);
+static CaptureContext* g_capture_context = nullptr; // UI/console owner; never changed by worker
+static bool stop_capture() {
     G.capture_run.store(false);
+    if (g_capture_context) SetEvent(g_capture_context->stop);
     if (g_capture_handle) {
-        WaitForSingleObject(g_capture_handle, 3000);
+        if (WaitForSingleObject(g_capture_handle, 3000) != WAIT_OBJECT_0) return false;
         CloseHandle(g_capture_handle);
         g_capture_handle = nullptr;
     }
+    if (g_capture_context) {
+        CloseHandle(g_capture_context->stop);
+        delete g_capture_context;
+        g_capture_context = nullptr;
+    }
+    return true;
 }
 static void start_capture() {
-    stop_capture();
+    if (!stop_capture()) {
+        ui_log(L"[audio] previous capture driver is still closing; retry the source selection shortly");
+        return;
+    }
+    HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stop) { ui_log(L"[audio] cannot create capture cancellation event"); return; }
+    uint32_t gen = g_capture_gen.fetch_add(1) + 1;
+    g_capture_context = new CaptureContext{ gen, stop };
+    g_cap_relaunches.store(0);
     G.capture_run.store(true);
     G.frames_captured.store(0);
     G.silence_frames.store(0);
-    g_capture_handle = CreateThread(nullptr, 0, capture_thread, nullptr, 0, nullptr);
+    g_capture_handle = CreateThread(nullptr, 0, capture_thread,
+                                    g_capture_context, 0, nullptr);
+    if (!g_capture_handle) {
+        G.capture_run.store(false);
+        CloseHandle(stop); delete g_capture_context; g_capture_context = nullptr;
+        ui_log(L"[audio] cannot create capture worker");
+    }
 }
 
 static void raop_resolve();
 static DWORD WINAPI discover_thread(LPVOID) { ssdp_discover(); raop_resolve(); return 0; }
-struct CastJob { int index; bool start; };
+static bool start_detached_thread(LPTHREAD_START_ROUTINE entry, const wchar_t* failure) {
+    HANDLE thread = CreateThread(nullptr, 0, entry, nullptr, 0, nullptr);
+    if (!thread) { ui_log(failure); return false; }
+    CloseHandle(thread);
+    return true;
+}
+struct CastJob { Renderer renderer; bool start; };
 static DWORD WINAPI cast_thread(LPVOID p);
+
+static bool same_renderer(const Renderer& a, const Renderer& b) {
+    return a.control_url == b.control_url && a.oh_url == b.oh_url;
+}
 
 // A device has ONE DAC: a DLNA session and an AirPlay session to the same host
 // are mutually exclusive. Stop any DLNA renderer bound to `host` before we hand
 // the device to RAOP (or the RAOP audio streams into a DAC still owned by DLNA).
 static void stop_dlna_to_host(const std::string& host) {
-    std::vector<int> victims;
+    std::vector<Renderer> victims;
     EnterCriticalSection(&G.cs);
-    for (size_t i = 0; i < G.renderers.size(); ++i)
-        if (G.renderers[i].streaming && G.renderers[i].host == host)
-            victims.push_back((int)i);
+    for (const auto& renderer : G.renderers)
+        if (renderer.streaming && renderer.host == host)
+            victims.push_back(renderer);
     LeaveCriticalSection(&G.cs);
-    for (int idx : victims) {
+    for (const auto& renderer : victims) {
         ui_log8("[raop] stopping DLNA session to " + host +
                 " first (one device, one output)");
-        CastJob* job = new CastJob{ idx, false };
+        CastJob* job = new CastJob{ renderer, false };
         HANDLE t = CreateThread(nullptr, 0, cast_thread, job, 0, nullptr);
         if (t) { WaitForSingleObject(t, 4000); CloseHandle(t); }
+        else { delete job; ui_log(L"[cast] cannot create DLNA stop worker"); }
     }
     if (!victims.empty()) Sleep(600);   // let the firmware release the pipeline
 }
 static DWORD WINAPI cast_thread(LPVOID p) {
     CastJob* job = (CastJob*)p;
+    Renderer r = job->renderer;
+    bool ok = true;
+    if (job->start) ok = start_cast(r);
+    else stop_cast(r);
     EnterCriticalSection(&G.cs);
-    bool valid = job->index >= 0 && job->index < (int)G.renderers.size();
-    Renderer r = valid ? G.renderers[job->index] : Renderer();
-    LeaveCriticalSection(&G.cs);
-    if (valid) {
-        bool ok = true;
-        if (job->start) ok = start_cast(r);
-        else stop_cast(r);
-        EnterCriticalSection(&G.cs);
-        if (job->index < (int)G.renderers.size())
-            G.renderers[job->index].streaming = job->start && ok;
-        LeaveCriticalSection(&G.cs);
-        PostMessageW(G.hwnd, WM_APP_RENDERS, 1, 0);   // refresh button labels only
+    for (auto& live : G.renderers) {
+        if (same_renderer(live, r)) {
+            live.streaming = job->start && ok;
+            break;
+        }
     }
+    LeaveCriticalSection(&G.cs);
+    PostMessageW(G.hwnd, WM_APP_RENDERS, 1, 0);   // refresh button labels only
     delete job;
     return 0;
 }
@@ -1710,12 +2097,232 @@ static DWORD WINAPI cast_thread(LPVOID p) {
 // GUI
 // ---------------------------------------------------------------------------
 static HFONT g_font = nullptr, g_font_big = nullptr;
-static HBRUSH g_flash_on = nullptr, g_flash_off = nullptr;
+
+// Low-glare dark palette for light-sensitive/night use. Avoid pure black,
+// pure white and high-energy blue accents.
+static const COLORREF CLR_BG        = RGB(22, 24, 27);    // #16181B
+static const COLORREF CLR_SURFACE   = RGB(34, 37, 42);    // #22252A
+static const COLORREF CLR_HOVER     = RGB(42, 45, 51);    // #2A2D33
+static const COLORREF CLR_PRESSED   = RGB(47, 41, 35);    // restrained brown
+static const COLORREF CLR_CHECKED   = RGB(61, 49, 39);
+static const COLORREF CLR_BORDER    = RGB(56, 61, 69);    // #383D45
+static const COLORREF CLR_FOCUS     = RGB(132, 99, 65);   // leather-brown
+static const COLORREF CLR_TEXT      = RGB(200, 204, 210); // #C8CCD2
+static const COLORREF CLR_SECONDARY = RGB(158, 165, 175); // #9EA5AF
+static const COLORREF CLR_DISABLED  = RGB(111, 116, 124);
+static const COLORREF CLR_FLASH_ON  = RGB(115, 86, 50);   // #735632 subdued ochre
+static const COLORREF CLR_FLASH_TXT = RGB(210, 213, 218); // soft gray, never white
+static const COLORREF CLR_TRACK     = RGB(74, 80, 90);
+static const COLORREF CLR_THUMB     = RGB(98, 105, 117);
+static const COLORREF CLR_THUMB_HOT = RGB(116, 123, 136);
+
+static HBRUSH g_br_bg = nullptr, g_br_surface = nullptr, g_br_hover = nullptr,
+              g_br_pressed = nullptr, g_br_checked = nullptr,
+              g_br_border = nullptr, g_br_flash_on = nullptr,
+              g_br_track = nullptr, g_br_thumb = nullptr,
+              g_br_thumb_hot = nullptr;
+static HPEN g_pen_border = nullptr, g_pen_focus = nullptr, g_pen_track = nullptr,
+            g_pen_thumb = nullptr;
+static bool g_beep_button_checked = false, g_localbeep_button_checked = false;
+
+static void init_dark_resources() {
+    if (g_br_bg) return;
+    g_br_bg       = CreateSolidBrush(CLR_BG);
+    g_br_surface  = CreateSolidBrush(CLR_SURFACE);
+    g_br_hover    = CreateSolidBrush(CLR_HOVER);
+    g_br_pressed  = CreateSolidBrush(CLR_PRESSED);
+    g_br_checked  = CreateSolidBrush(CLR_CHECKED);
+    g_br_border   = CreateSolidBrush(CLR_BORDER);
+    g_br_flash_on = CreateSolidBrush(CLR_FLASH_ON);
+    g_br_track    = CreateSolidBrush(CLR_TRACK);
+    g_br_thumb    = CreateSolidBrush(CLR_THUMB);
+    g_br_thumb_hot = CreateSolidBrush(CLR_THUMB_HOT);
+    g_pen_border  = CreatePen(PS_SOLID, 1, CLR_BORDER);
+    g_pen_focus   = CreatePen(PS_SOLID, 1, CLR_FOCUS);
+    g_pen_track   = CreatePen(PS_SOLID, 2, CLR_TRACK);
+    g_pen_thumb   = CreatePen(PS_SOLID, 1, CLR_THUMB);
+}
+
+static void free_dark_resources() {
+    for (HGDIOBJ o : { (HGDIOBJ)g_pen_thumb, (HGDIOBJ)g_pen_track,
+                       (HGDIOBJ)g_pen_focus,
+                       (HGDIOBJ)g_pen_border,
+                       (HGDIOBJ)g_br_thumb_hot, (HGDIOBJ)g_br_thumb,
+                       (HGDIOBJ)g_br_track,
+                       (HGDIOBJ)g_br_flash_on, (HGDIOBJ)g_br_border,
+                       (HGDIOBJ)g_br_checked, (HGDIOBJ)g_br_pressed,
+                       (HGDIOBJ)g_br_hover, (HGDIOBJ)g_br_surface,
+                       (HGDIOBJ)g_br_bg, (HGDIOBJ)g_font_big,
+                       (HGDIOBJ)g_font })
+        if (o) DeleteObject(o);
+    g_pen_thumb = g_pen_track = g_pen_focus = g_pen_border = nullptr;
+    g_br_thumb_hot = g_br_thumb = g_br_track = nullptr;
+    g_br_flash_on = g_br_border = nullptr;
+    g_br_checked = g_br_pressed = nullptr;
+    g_br_hover = g_br_surface = g_br_bg = nullptr;
+    g_font_big = g_font = nullptr;
+}
+
+static void apply_dark_titlebar(HWND hwnd) {
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (!dwm) return;
+    typedef HRESULT (WINAPI *PDwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+    auto set_attr = (PDwmSetWindowAttribute)(void*)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    if (set_attr) {
+        BOOL dark = TRUE;
+        if (FAILED(set_attr(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/,
+                            &dark, sizeof(dark))))
+            set_attr(hwnd, 19 /*older Windows 10 value*/, &dark, sizeof(dark));
+        COLORREF border = CLR_BORDER, caption = CLR_BG, text = CLR_TEXT;
+        set_attr(hwnd, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof(border));
+        set_attr(hwnd, 35 /*DWMWA_CAPTION_COLOR*/, &caption, sizeof(caption));
+        set_attr(hwnd, 36 /*DWMWA_TEXT_COLOR*/, &text, sizeof(text));
+    }
+    FreeLibrary(dwm);
+}
+
+static void apply_control_dark_theme(HWND hwnd, const wchar_t* theme = L"DarkMode_Explorer") {
+    typedef HRESULT (WINAPI *PSetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
+    static HMODULE ux = LoadLibraryW(L"uxtheme.dll");
+    static PSetWindowTheme set_theme = ux
+        ? (PSetWindowTheme)(void*)GetProcAddress(ux, "SetWindowTheme") : nullptr;
+    if (set_theme) set_theme(hwnd, theme, nullptr); // custom drawing remains fallback
+}
+
+static bool move_tab_focus(HWND current, bool reverse) {
+    HWND parent = GetParent(current);
+    std::vector<HWND> tabs;
+    for (HWND c = GetWindow(parent, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+        LONG_PTR style = GetWindowLongPtrW(c, GWL_STYLE);
+        if ((style & WS_TABSTOP) && IsWindowVisible(c) && IsWindowEnabled(c))
+            tabs.push_back(c);
+    }
+    if (tabs.empty()) return false;
+    size_t at = 0;
+    while (at < tabs.size() && tabs[at] != current) ++at;
+    if (at == tabs.size()) at = 0;
+    else if (reverse) at = (at + tabs.size() - 1) % tabs.size();
+    else at = (at + 1) % tabs.size();
+    SetFocus(tabs[at]);
+    return true;
+}
+
+static LRESULT CALLBACK dark_button_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                              UINT_PTR id, DWORD_PTR) {
+    if (msg == WM_KEYDOWN && wp == VK_TAB &&
+        move_tab_focus(hwnd, (GetKeyState(VK_SHIFT) & 0x8000) != 0))
+        return 0;
+    if (msg == WM_MOUSEMOVE && !GetPropW(hwnd, L"LowCastDarkHot")) {
+        SetPropW(hwnd, L"LowCastDarkHot", (HANDLE)1);
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else if (msg == WM_MOUSELEAVE) {
+        RemovePropW(hwnd, L"LowCastDarkHot");
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS || msg == WM_ENABLE) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else if (msg == WM_NCDESTROY) {
+        RemovePropW(hwnd, L"LowCastDarkHot");
+        RemoveWindowSubclass(hwnd, dark_button_subclass, id);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+static void apply_dark_button(HWND hwnd) {
+    apply_control_dark_theme(hwnd);
+    SetWindowSubclass(hwnd, dark_button_subclass, 2, 0);
+}
+
+static void draw_focus_ring(HDC dc, RECT rc);
+static bool draw_dark_button_item(const DRAWITEMSTRUCT* dis);
+
+static void paint_dark_combo(HWND hwnd, HDC dc) {
+    RECT rc{}; GetClientRect(hwnd, &rc);
+    bool disabled = !IsWindowEnabled(hwnd);
+    bool focused = GetFocus() == hwnd;
+    bool hot = GetPropW(hwnd, L"LowCastComboHot") != nullptr;
+    bool dropped = SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != FALSE;
+    FillRect(dc, &rc, disabled ? g_br_bg : g_br_surface);
+
+    int arrow_w = GetSystemMetrics(SM_CXVSCROLL);
+    if (arrow_w < 18) arrow_w = 18;
+    RECT arrow{ rc.right - arrow_w, rc.top, rc.right, rc.bottom };
+    FillRect(dc, &arrow, disabled ? g_br_bg : dropped ? g_br_pressed :
+             hot ? g_br_hover : g_br_surface);
+    RECT divider{ arrow.left, rc.top + 2, arrow.left + 1, rc.bottom - 2 };
+    FillRect(dc, &divider, g_br_border);
+
+    wchar_t text[512] = L"";
+    int sel = (int)SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
+    if (sel >= 0) SendMessageW(hwnd, CB_GETLBTEXT, sel, (LPARAM)text);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, disabled ? CLR_DISABLED : CLR_TEXT);
+    HFONT font = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0);
+    HGDIOBJ old_font = font ? SelectObject(dc, font) : nullptr;
+    RECT tr{ rc.left + 7, rc.top, arrow.left - 5, rc.bottom };
+    DrawTextW(dc, text, -1, &tr,
+              DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (old_font) SelectObject(dc, old_font);
+
+    int cx = (arrow.left + arrow.right) / 2;
+    int cy = (arrow.top + arrow.bottom) / 2;
+    HGDIOBJ old_pen = SelectObject(dc, g_pen_track);
+    MoveToEx(dc, cx - 4, cy - 2, nullptr);
+    LineTo(dc, cx, cy + 2);
+    LineTo(dc, cx + 4, cy - 2);
+    SelectObject(dc, old_pen);
+    FrameRect(dc, &rc, focused ? g_br_checked : g_br_border);
+    if (focused && !disabled) draw_focus_ring(dc, rc);
+}
+
+static LRESULT CALLBACK dark_combo_subclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                             UINT_PTR id, DWORD_PTR) {
+    if (msg == WM_KEYDOWN && wp == VK_TAB &&
+        move_tab_focus(hwnd, (GetKeyState(VK_SHIFT) & 0x8000) != 0))
+        return 0;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        paint_dark_combo(hwnd, dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    if (msg == WM_PRINTCLIENT) {
+        paint_dark_combo(hwnd, (HDC)wp);
+        return 0;
+    }
+    if (msg == WM_MOUSEMOVE && !GetPropW(hwnd, L"LowCastComboHot")) {
+        SetPropW(hwnd, L"LowCastComboHot", (HANDLE)1);
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else if (msg == WM_MOUSELEAVE) {
+        RemovePropW(hwnd, L"LowCastComboHot");
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS || msg == WM_ENABLE ||
+               msg == CB_SHOWDROPDOWN || msg == CB_SETCURSEL) {
+        LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return result;
+    } else if (msg == WM_NCDESTROY) {
+        RemovePropW(hwnd, L"LowCastComboHot");
+        RemoveWindowSubclass(hwnd, dark_combo_subclass, id);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+static void apply_dark_combo(HWND hwnd) {
+    apply_control_dark_theme(hwnd, L"DarkMode_CFD");
+    SetWindowSubclass(hwnd, dark_combo_subclass, 3, 0);
+}
 
 static std::vector<HWND> g_render_buttons;   // owned by the UI thread only
+static std::vector<Renderer> g_dlna_button_targets; // stable identities for posted clicks
+static std::vector<AirplayDev> g_airplay_button_targets;
 
 // AirPlay combo mappings — shared by the UI handlers and settings load/save
-static const int g_ap_lats[7] = { 25, 50, 75, 100, 150, 250, 350 };
+static const int g_ap_lats[10] = { 25, 30, 40, 50, 75, 100, 150, 250, 275, 350 };
 
 // ---------------------------------------------------------------------------
 // Settings persistence: %APPDATA%\LowCast.ini — format, rates, AirPlay
@@ -1737,7 +2344,9 @@ static void save_settings(HWND h) {
     };
     put(L"fmt",   (int)SendMessageW(G.cmb_fmt,   CB_GETCURSEL, 0, 0));
     put(L"rate",  (int)SendMessageW(G.cmb_rate,  CB_GETCURSEL, 0, 0));
-    put(L"aplat", (int)SendMessageW(G.cmb_aplat, CB_GETCURSEL, 0, 0));
+    {   int lsel = (int)SendMessageW(G.cmb_aplat, CB_GETCURSEL, 0, 0);
+        put(L"aplatms", (lsel >= 0 && lsel < 10) ? g_ap_lats[lsel] : 150);  // by VALUE
+    }
     put(L"apvolpct", G.ap_start_vol.load());   // percent; -1 = never touched
     int ds = (int)SendMessageW(G.cmb_dev, CB_GETCURSEL, 0, 0);
     wchar_t dn[256] = L"";
@@ -1760,8 +2369,20 @@ static void load_settings() {
         SendMessageW(G.cmb_rate, CB_SETCURSEL, rsel, 0);
         G.upmult.store(rsel == 2 ? 4 : rsel == 1 ? 2 : 1);
     }
-    int ls = geti(L"aplat", 4);
-    if (ls >= 0 && ls < 7) { SendMessageW(G.cmb_aplat, CB_SETCURSEL, ls, 0); G.ap_latency_ms.store(g_ap_lats[ls]); }
+    int lms = geti(L"aplatms", -1);
+    if (lms < 0) {
+        // migrate pre-value-format saves: old key stored the dropdown INDEX
+        // into the original 7-entry table. Honor it so selections survive.
+        static const int old_lats[7] = { 25, 50, 75, 100, 150, 250, 350 };
+        int oidx = geti(L"aplat", -1);
+        lms = (oidx >= 0 && oidx < 7) ? old_lats[oidx] : 150;
+    }
+    for (int i = 0; i < 10; ++i)
+        if (g_ap_lats[i] == lms) {
+            SendMessageW(G.cmb_aplat, CB_SETCURSEL, i, 0);
+            G.ap_latency_ms.store(lms);
+            break;
+        }
     int vs = geti(L"apvolpct", -1);
     if (vs >= 0 && vs <= 100) {
         SendMessageW(G.sld_apvol, TBM_SETPOS, TRUE, 100 - vs);   // top = 100%
@@ -1791,6 +2412,8 @@ static void layout_renderer_buttons(HWND hwnd) {
     // destroy old buttons (UI thread owns these; survives renderer list swaps)
     for (HWND b : g_render_buttons) if (b) DestroyWindow(b);
     g_render_buttons.clear();
+    g_dlna_button_targets.clear();
+    g_airplay_button_targets.clear();
     EnterCriticalSection(&G.cs);
     for (auto& r : G.renderers) r.button = nullptr;
     for (auto& d : g_airplay) d.button = nullptr;
@@ -1806,12 +2429,14 @@ static void layout_renderer_buttons(HWND hwnd) {
         std::wstring label = (r.streaming ? L"\x25A0  STOP   —  " : L"\x25B6  START  —  ")
                              + utf8_to_wide(r.name);
         r.button = CreateWindowW(L"BUTTON", label.c_str(),
-                                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                  12, y, 560, 34, hwnd,
                                  (HMENU)(uintptr_t)(IDC_RENDER_BASE + i),
                                  nullptr, nullptr);
         SendMessageW(r.button, WM_SETFONT, (WPARAM)g_font_big, TRUE);
+        apply_dark_button(r.button);
         g_render_buttons.push_back(r.button);
+        g_dlna_button_targets.push_back(r);
         y += 40;
     }
     LeaveCriticalSection(&G.cs);
@@ -1825,12 +2450,14 @@ static void layout_renderer_buttons(HWND hwnd) {
                                    : L"\x25B6  START  \x2014  \x26A1 AirPlay: ")
                              + utf8_to_wide(d.name);
         d.button = CreateWindowW(L"BUTTON", label.c_str(),
-                                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                  12, y, 560, 34, hwnd,
                                  (HMENU)(uintptr_t)(IDC_RENDER_BASE + 1000 + i),
                                  nullptr, nullptr);
         SendMessageW(d.button, WM_SETFONT, (WPARAM)g_font_big, TRUE);
+        apply_dark_button(d.button);
         g_render_buttons.push_back(d.button);
+        g_airplay_button_targets.push_back(d);
         y += 40;
     }
     LeaveCriticalSection(&G.cs);
@@ -1846,13 +2473,16 @@ static void layout_renderer_buttons(HWND hwnd) {
 }
 
 static void sync_airplay_button_state() {
-    static bool was_running = false;
     bool running = raop_is_running();
-    if (was_running && !running) {
+    if (!running) {
+        // A handshake can fail between two 250 ms UI ticks. Clear stale
+        // optimistic flags on every no-session tick so the next click starts.
+        bool reset = false;
         EnterCriticalSection(&G.cs);
-        for (auto& d : g_airplay) d.streaming = false;
+        for (auto& d : g_airplay)
+            if (d.streaming) { d.streaming = false; reset = true; }
         LeaveCriticalSection(&G.cs);
-        ui_log(L"[raop] session ended \x2014 button reset");
+        if (reset) ui_log(L"[raop] session ended \x2014 button reset");
     }
     EnterCriticalSection(&G.cs);
     for (auto& d : g_airplay) {
@@ -1865,10 +2495,369 @@ static void sync_airplay_button_state() {
         if (want != cur) SetWindowTextW(d.button, want.c_str());
     }
     LeaveCriticalSection(&G.cs);
-    was_running = running;
+}
+
+// ---------------------------------------------------------------------------
+// Headset battery, piggybacked on the PC's Bluetooth pairing. Windows reads
+// it over BT (Settings shows the %) and publishes it in the PnP device tree
+// as DEVPKEY_Bluetooth_Battery on the BTHENUM/BTHLE node. cfgmgr32 is
+// dynamically loaded; no new link dependency. CAVEAT shown to the user via
+// naming: the value is only FRESH while the BT link is connected — if the
+// headset drops Bluetooth in WiFi mode, this is "last known", not live.
+// ---------------------------------------------------------------------------
+static std::atomic<int> g_hp_batt{-1};
+
+static void poll_bt_battery() {
+    typedef DWORD (WINAPI *PSizeW)(PULONG, PCWSTR, ULONG);
+    typedef DWORD (WINAPI *PListW)(PCWSTR, PWCHAR, ULONG, ULONG);
+    typedef DWORD (WINAPI *PLocate)(DWORD*, PWCHAR, ULONG);
+    typedef DWORD (WINAPI *PGetProp)(DWORD, const void*, PULONG, PBYTE, PULONG, ULONG);
+    static PSizeW pSize; static PListW pList; static PLocate pLoc; static PGetProp pProp;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE m = LoadLibraryW(L"cfgmgr32.dll");
+        if (m) {
+            pSize = (PSizeW)GetProcAddress(m, "CM_Get_Device_ID_List_SizeW");
+            pList = (PListW)GetProcAddress(m, "CM_Get_Device_ID_ListW");
+            pLoc  = (PLocate)GetProcAddress(m, "CM_Locate_DevNodeW");
+            pProp = (PGetProp)GetProcAddress(m, "CM_Get_DevNode_PropertyW");
+        }
+    }
+    if (!pSize || !pList || !pLoc || !pProp) return;
+    struct PK { GUID g; ULONG pid; };
+    static const PK KEY_BATT = { {0x104EA319,0x6EE2,0x4701,
+                                  {0xBD,0x47,0x8D,0xDB,0xF4,0x25,0xBB,0xE5}}, 2 };
+    static const PK KEY_NAME = { {0xA45C254E,0xDF1C,0x4EFD,
+                                  {0x80,0x20,0x67,0xD1,0x46,0xA8,0x50,0xE0}}, 14 };
+    const wchar_t* enums[3] = { L"BTHENUM", L"BTHLE", L"BTHLEDevice" };
+    int best = -1;
+    wchar_t best_name[256] = L"";
+    bool best_is_he = false;
+    for (int e = 0; e < 3; ++e) {
+        ULONG len = 0;
+        if (pSize(&len, enums[e], 0x1 /*FILTER_ENUMERATOR*/) != 0 || len < 2) continue;
+        std::vector<wchar_t> ids(len);
+        if (pList(enums[e], ids.data(), len, 0x1) != 0) continue;
+        for (wchar_t* p = ids.data(); *p; p += wcslen(p) + 1) {
+            DWORD dn = 0;
+            if (pLoc(&dn, p, 0) != 0) continue;
+            BYTE bv = 0; ULONG sz = sizeof(bv), ty = 0;
+            if (pProp(dn, &KEY_BATT, &ty, &bv, &sz, 0) != 0 || bv > 100) continue;
+            static const PK KEY_NAME2 = { {0xB725F130,0x47EF,0x101A,
+                                           {0xA5,0xF1,0x02,0x60,0x8C,0x9E,0xEB,0xAC}}, 10 };
+            static const PK KEY_DESC  = { {0xA45C254E,0xDF1C,0x4EFD,
+                                           {0x80,0x20,0x67,0xD1,0x46,0xA8,0x50,0xE0}}, 2 };
+            wchar_t nm[256] = L""; sz = sizeof(nm); ty = 0;
+            pProp(dn, &KEY_NAME, &ty, (PBYTE)nm, &sz, 0);
+            nm[255] = 0;
+            if (wcslen(nm) < 3) {                 // stub/absent FriendlyName:
+                sz = sizeof(nm); ty = 0;          // fall back through NAME then
+                pProp(dn, &KEY_NAME2, &ty, (PBYTE)nm, &sz, 0);   // DeviceDesc
+                nm[255] = 0;
+            }
+            if (wcslen(nm) < 3) {
+                sz = sizeof(nm); ty = 0;
+                pProp(dn, &KEY_DESC, &ty, (PBYTE)nm, &sz, 0);
+                nm[255] = 0;
+            }
+            bool is_he = wcsstr(nm, L"HE1000") || wcsstr(nm, L"HIFIMAN") ||
+                         wcsstr(nm, L"HiFiMAN") || wcsstr(nm, L"Hifiman");
+            if (best < 0 || (is_he && !best_is_he)) {
+                best = bv; best_is_he = is_he;
+                wcsncpy(best_name, nm, 255); best_name[255] = 0;
+            }
+        }
+    }
+    int prev = g_hp_batt.load();
+    if (best >= 0) prev = g_hp_batt.exchange(best); // retain the last known value
+    if (best >= 0 && prev < 0) {                  // announce the source ONCE so
+        wchar_t lb[320];                          // a wrong device pick is visible
+        swprintf(lb, 320, L"[batt] %ls battery: %d%%",
+                 best_name[0] ? best_name : L"headset", best);
+        ui_log(lb);
+    }
+    static bool said_none = false;
+    if (best < 0 && prev < 0 && !said_none) {     // the NEGATIVE is logged too:
+        said_none = true;                         // "clipped" vs "not found" must
+        ui_log(L"[batt] no Bluetooth battery property found \x2014 "
+               L"is the headset's Bluetooth link connected?");
+    }
+}
+
+// ---- persistent low-battery application alert (40%, 20%, 10%) -------------
+// The worker publishes readings only. The UI timer owns this state and every
+// HWND operation, so a launch-time reading cannot spend an alert before the UI
+// exists. A failed create/update stays pending and is retried.
+static HICON g_app_icon = nullptr;
+static HICON g_app_icon_small = nullptr;
+enum class BatteryAlertPresentResult { Failed, Created, Updated };
+struct BatteryAlertState {
+    int delivered_level = 0;       // 0, 1=40%, 2=20%, 3=10% this charge cycle
+    int visible_level = 0;         // only Acknowledge returns this to zero
+    int retry_level = 0;
+    uint64_t retry_after_ms = 0;
+    HWND hwnd = nullptr;
+    HWND message = nullptr;
+    HWND acknowledge = nullptr;
+    bool shutting_down = false;
+};
+static BatteryAlertState g_battery_alert;
+static const wchar_t* BATTERY_ALERT_CLASS = L"LowCastBatteryAlertWnd";
+static const uint64_t BATTERY_ALERT_RETRY_MS = 5000;
+
+static int battery_alert_level(int pct) {
+    if (pct < 0 || pct > 100) return 0;
+    if (pct <= 10) return 3;
+    if (pct <= 20) return 2;
+    if (pct <= 40) return 1;
+    return 0;
+}
+
+static int battery_alert_threshold(int level) {
+    return level == 3 ? 10 : level == 2 ? 20 : level == 1 ? 40 : 0;
+}
+
+static const wchar_t* battery_alert_severity(int level) {
+    return level == 3 ? L"URGENT" : level == 2 ? L"CRITICAL" : L"LOW";
+}
+
+static int battery_alert_candidate(BatteryAlertState& state, int pct,
+                                   uint64_t now) {
+    if (pct < 0 || pct > 100) return 0;
+    if (pct >= 80) {
+        state.delivered_level = 0;
+        state.retry_level = 0;
+        state.retry_after_ms = 0;
+        return 0;                   // an existing alert still awaits its button
+    }
+    int level = battery_alert_level(pct);
+    if (!level || level <= state.delivered_level) return 0;
+    // A more urgent threshold bypasses an older failed-delivery backoff.
+    if (level <= state.retry_level && now < state.retry_after_ms) return 0;
+    return level;
+}
+
+static void battery_alert_text(int level, int pct, wchar_t* title,
+                               size_t title_count, wchar_t* message,
+                               size_t message_count) {
+    swprintf(title, title_count, L"LowCast \x2014 Headset battery %ls",
+             battery_alert_severity(level));
+    swprintf(message, message_count,
+             L"Headset battery: %d%% remaining\r\n\r\n"
+             L"Charge the headset %ls. This alert stays open until you "
+             L"acknowledge it.",
+             pct, level >= 2 ? L"now" : L"soon");
+}
+
+static LRESULT CALLBACK battery_alert_wndproc(HWND h, UINT m, WPARAM wp,
+                                               LPARAM lp) {
+    BatteryAlertState* state =
+        reinterpret_cast<BatteryAlertState*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (m == WM_NCCREATE) {
+        CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lp);
+        state = reinterpret_cast<BatteryAlertState*>(create->lpCreateParams);
+        SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+    switch (m) {
+    case WM_CREATE: {
+        if (!state) return -1;
+        state->message = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+            20, 18, 390, 78, h, nullptr, nullptr, nullptr);
+        state->acknowledge = CreateWindowW(L"BUTTON", L"Acknowledge",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            274, 105, 136, 32, h, (HMENU)(uintptr_t)IDC_BATTERY_ACK,
+            nullptr, nullptr);
+        if (!state->message || !state->acknowledge) return -1;
+        HFONT font = g_font ? g_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        SendMessageW(state->message, WM_SETFONT, (WPARAM)font, TRUE);
+        SendMessageW(state->acknowledge, WM_SETFONT, (WPARAM)font, TRUE);
+        apply_dark_button(state->acknowledge);
+        return 0;
+    }
+    case WM_ERASEBKGND: {
+        RECT rc{}; GetClientRect(h, &rc);
+        FillRect((HDC)wp, &rc, g_br_bg ? g_br_bg : GetSysColorBrush(COLOR_WINDOW));
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC:
+        SetBkMode((HDC)wp, TRANSPARENT);
+        SetTextColor((HDC)wp, g_br_bg ? CLR_TEXT : GetSysColor(COLOR_WINDOWTEXT));
+        return (LRESULT)(g_br_bg ? g_br_bg : GetSysColorBrush(COLOR_WINDOW));
+    case WM_DRAWITEM:
+        if (draw_dark_button_item(reinterpret_cast<DRAWITEMSTRUCT*>(lp))) return TRUE;
+        break;
+    case WM_COMMAND:
+        if (state && LOWORD(wp) == IDC_BATTERY_ACK && HIWORD(wp) == BN_CLICKED) {
+            wchar_t line[128];
+            swprintf(line, 128,
+                     L"[batt] application alert acknowledged at %d%% threshold",
+                     battery_alert_threshold(state->visible_level));
+            ui_log(line);
+            state->visible_level = 0;
+            DestroyWindow(h);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        // X/Alt+F4 are not acknowledgment. Shutdown uses the helper below.
+        if (state && state->shutting_down) DestroyWindow(h);
+        return 0;
+    case WM_NCDESTROY:
+        if (state) {
+            state->hwnd = nullptr;
+            state->message = nullptr;
+            state->acknowledge = nullptr;
+        }
+        return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static bool battery_alert_register_class() {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = battery_alert_wndproc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = BATTERY_ALERT_CLASS;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = g_app_icon_small ? g_app_icon_small : LoadIconW(nullptr, IDI_WARNING);
+    wc.hbrBackground = nullptr;
+    if (RegisterClassW(&wc)) return true;
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+struct BatteryAlertWindowOptions { bool show = true; };
+static BatteryAlertPresentResult battery_alert_present_window(
+    BatteryAlertState& state, int level, int pct, void* context) {
+    BatteryAlertWindowOptions* options =
+        reinterpret_cast<BatteryAlertWindowOptions*>(context);
+    bool show = !options || options->show;
+    bool created = false;
+    if (state.hwnd && !IsWindow(state.hwnd)) state.hwnd = nullptr;
+    if (!state.hwnd) {
+        if (!battery_alert_register_class()) return BatteryAlertPresentResult::Failed;
+        state.shutting_down = false;
+        state.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            BATTERY_ALERT_CLASS, L"LowCast \x2014 Headset battery",
+            WS_POPUP | WS_CAPTION,
+            0, 0, 440, 184, nullptr, nullptr, GetModuleHandleW(nullptr), &state);
+        if (!state.hwnd) return BatteryAlertPresentResult::Failed;
+        apply_dark_titlebar(state.hwnd);
+        created = true;
+    }
+    wchar_t title[96], message[320];
+    battery_alert_text(level, pct, title, 96, message, 320);
+    if (!SetWindowTextW(state.hwnd, title) ||
+        !SetWindowTextW(state.message, message)) {
+        if (created) {
+            state.shutting_down = true;
+            DestroyWindow(state.hwnd);
+            state.shutting_down = false;
+        }
+        return BatteryAlertPresentResult::Failed;
+    }
+    if (show) {
+        RECT work{};
+        if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) ||
+            work.right <= work.left || work.bottom <= work.top) {
+            work.left = work.top = 0;
+            work.right = GetSystemMetrics(SM_CXSCREEN);
+            work.bottom = GetSystemMetrics(SM_CYSCREEN);
+        }
+        int x = work.right - 440 - 24;
+        int y = work.bottom - 184 - 24;
+        if (!SetWindowPos(state.hwnd, HWND_TOPMOST, x, y, 440, 184,
+                          SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+            if (created) {
+                state.shutting_down = true;
+                DestroyWindow(state.hwnd);
+                state.shutting_down = false;
+            }
+            return BatteryAlertPresentResult::Failed;
+        }
+    }
+    return created ? BatteryAlertPresentResult::Created
+                   : BatteryAlertPresentResult::Updated;
+}
+
+typedef BatteryAlertPresentResult (*BatteryAlertPresenter)(
+    BatteryAlertState&, int, int, void*);
+static bool battery_alert_process_reading(BatteryAlertState& state, int pct,
+                                          uint64_t now,
+                                          BatteryAlertPresenter presenter,
+                                          void* context) {
+    if (state.shutting_down) return false;
+    int level = battery_alert_candidate(state, pct, now);
+    if (!level) return false;
+    BatteryAlertPresentResult result = presenter(state, level, pct, context);
+    if (result == BatteryAlertPresentResult::Failed) {
+        state.retry_level = level;
+        state.retry_after_ms = now + BATTERY_ALERT_RETRY_MS;
+        wchar_t line[160];
+        swprintf(line, 160,
+                 L"[batt] application alert create/update failed for %d%% "
+                 L"threshold; retrying in 5 seconds",
+                 battery_alert_threshold(level));
+        ui_log(line);
+        return false;
+    }
+    state.delivered_level = level;
+    state.visible_level = level;
+    state.retry_level = 0;
+    state.retry_after_ms = 0;
+    wchar_t line[192];
+    swprintf(line, 192,
+             L"[batt] application alert %ls for %d%% threshold (reading %d%%); "
+             L"awaiting acknowledgment",
+             result == BatteryAlertPresentResult::Created ? L"created" : L"updated",
+             battery_alert_threshold(level), pct);
+    ui_log(line);
+    return true;
+}
+
+static void battery_alert_shutdown(BatteryAlertState& state) {
+    state.shutting_down = true;
+    if (state.hwnd && IsWindow(state.hwnd)) DestroyWindow(state.hwnd);
+    state.hwnd = nullptr;
+    state.message = nullptr;
+    state.acknowledge = nullptr;
+    state.visible_level = 0;
+}
+
+static DWORD WINAPI battery_thread(LPVOID) {
+    int ticks = 0, last_logged = -2;
+    for (;;) {
+        poll_bt_battery();
+        int cur = g_hp_batt.load();
+        if (last_logged == -2) last_logged = cur;   // first value is announced by
+                                                    // poll_bt_battery; arm change
+                                                    // logging now, not after 1 h
+        bool hourly = (++ticks % 120) == 0;       // 120 x 30s = 1 h heartbeat
+        if (cur != last_logged) {
+            // log on any VALUE CHANGE and (below) on the hourly mark: builds the
+            // battery timeline needed to correlate late-night radio deaths
+            // with charge state (and exposes a stale never-changing property).
+            // A -1 -> valid transition was just announced by poll_bt_battery.
+            if (!(last_logged < 0 && cur >= 0)) {
+                wchar_t bl[64];
+                if (cur >= 0) swprintf(bl, 64, L"[batt] headset battery: %d%%", cur);
+                else          swprintf(bl, 64, L"[batt] headset battery: unavailable");
+                ui_log(bl);
+            }
+            last_logged = cur;
+        } else if (hourly) {
+            wchar_t bl[64];
+            if (cur >= 0) swprintf(bl, 64, L"[batt] headset battery: %d%% (hourly)", cur);
+            else          swprintf(bl, 64, L"[batt] headset battery: unavailable (hourly)");
+            ui_log(bl);
+        }
+        Sleep(30000);
+    }
 }
 
 static void update_stats() {
+    battery_alert_process_reading(g_battery_alert, g_hp_batt.load(), now_ms(),
+                                  battery_alert_present_window, nullptr);
     sync_airplay_button_state();
     Fmt f = (Fmt)G.fmt.load();
     uint32_t rate = G.sample_rate.load();
@@ -1883,77 +2872,271 @@ static void update_stats() {
     if (raop_is_running()) {
         double secs_sent, hb_age; unsigned long long rs; unsigned rc;
         raop_stats(secs_sent, hb_age, rs, rc);
+        int fl = raop_suggested_floor_ms();
+        wchar_t flb[32];
+        if (fl < 0) swprintf(flb, 32, L"measuring\x2026");
+        else        swprintf(flb, 32, L"\x2248%dms", fl);
         swprintf(b, 512,
-            L"AirPlay LIVE: %.1f s of audio sent   heartbeat: %s%.1fs ago   "
-            L"resends: %llu   reconnects: %u\r\n"
-            L"DLNA: %u Hz / %d-bit / %s   connections: %d   sent: %.1f MB\r\n"
-            L"If 'audio sent' climbs but you hear silence, another session "
-            L"(Spotify?) owns the receiver.",
+            L"AirPlay LIVE: %.1f s of audio sent   heartbeat: %ls%.1fs ago   "
+            L"resends: %llu   reconnects: %u   observed sender cushion %ls\r\n"
+            L"DLNA: %u Hz / %d-bit / %ls   connections: %d   sent: %.1f MB\r\n"
+            L"Sender counters cannot confirm receiver playback. "
+            L"If silent, check the session log or restart the stream.",
             secs_sent, hb_age < 0 ? L"NONE " : L"", hb_age < 0 ? 0.0 : hb_age,
-            rs, rc,
+            rs, rc, flb,
             rate, fmt_bits(f), fmt_is_wav(f) ? L"WAV" : L"LPCM", nclients,
             sent / 1048576.0);
     } else {
         swprintf(b, 512,
-            L"Stream: %u Hz / %d-bit / %s  (%.1f Mbit/s)      Renderer connections: %d\r\n"
+            L"Stream: %u Hz / %d-bit / %ls  (%.1f Mbit/s)      Renderer connections: %d\r\n"
             L"Sender-side latency (capture\x2192network): %.1f ms      Sent: %.1f MB\r\n"
             L"End-to-end = sender + headphone firmware buffer \x2192 use the beep test",
             rate, fmt_bits(f), fmt_is_wav(f) ? L"WAV" : L"LPCM", mbit, nclients,
             backlog10 / 10.0 + 3.0 /*capture poll*/, sent / 1048576.0);
     }
     SetWindowTextW(G.stat, b);
+    {
+        int hpb = g_hp_batt.load();
+        wchar_t bt[24];
+        int level = battery_alert_level(hpb);
+        if (level == 3) swprintf(bt, 24, L"URGENT: %d%%", hpb);
+        else if (level == 2) swprintf(bt, 24, L"CRIT: %d%%", hpb);
+        else if (level == 1) swprintf(bt, 24, L"LOW: %d%%", hpb);
+        else if (hpb >= 0) swprintf(bt, 24, L"bat: %d%%", hpb);
+        else               swprintf(bt, 24, L"bat: \x2014");
+        SetWindowTextW(G.lbl_batt, bt);
+    }
+}
+
+// Trackbar subclass: stock trackbars treat a click on the channel as a PAGE
+// step toward the click; we want click-anywhere-to-grab. On button-down the
+// thumb is moved to the clicked position first, then the SAME message is
+// handed to the default proc — which now finds the thumb under the cursor
+// and begins a native drag, so the motion continues while the mouse is held.
+static void paint_dark_volume_control(HWND hw, HDC dc) {
+    RECT bounds{}, thumb{};
+    GetClientRect(hw, &bounds); // NMCUSTOMDRAW.rc can be only the invalid region
+    SendMessageW(hw, TBM_GETTHUMBRECT, 0, (LPARAM)&thumb);
+    bool hot = GetPropW(hw, L"LowCastVolumeHot") != nullptr;
+    bool pressed = GetCapture() == hw && (GetKeyState(VK_LBUTTON) & 0x8000);
+    HBRUSH thumb_fill = pressed ? g_br_track : hot ? g_br_thumb_hot : g_br_thumb;
+    paint_lowcast_volume_track(dc, bounds, thumb, g_br_bg, g_br_thumb,
+                               thumb_fill, g_br_track, g_pen_thumb,
+                               GetFocus() == hw);
+}
+
+static LRESULT CALLBACK apvol_subclass(HWND hw, UINT m, WPARAM wp, LPARAM lp,
+                                       UINT_PTR id, DWORD_PTR) {
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hw, &ps);
+        paint_dark_volume_control(hw, dc);
+        EndPaint(hw, &ps);
+        return 0;
+    }
+    if (m == WM_PRINTCLIENT) {
+        paint_dark_volume_control(hw, (HDC)wp);
+        return 0;
+    }
+    if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_KEYDOWN && wp == VK_TAB &&
+        move_tab_focus(hw, (GetKeyState(VK_SHIFT) & 0x8000) != 0))
+        return 0;
+    if (m == WM_MOUSEMOVE && !GetPropW(hw, L"LowCastVolumeHot")) {
+        SetPropW(hw, L"LowCastVolumeHot", (HANDLE)1);
+        TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hw, 0 };
+        TrackMouseEvent(&tme);
+        InvalidateRect(hw, nullptr, FALSE);
+    } else if (m == WM_MOUSELEAVE) {
+        RemovePropW(hw, L"LowCastVolumeHot");
+        InvalidateRect(hw, nullptr, FALSE);
+    }
+    if (m == WM_LBUTTONDOWN) {
+        RECT ch{}, th{};
+        SendMessageW(hw, TBM_GETCHANNELRECT, 0, (LPARAM)&ch);
+        SendMessageW(hw, TBM_GETTHUMBRECT, 0, (LPARAM)&th);
+        int pos = lowcast_vertical_volume_pos(ch, th, (int)(short)HIWORD(lp));
+        if (pos >= 0) {
+            SendMessageW(hw, TBM_SETPOS, TRUE, pos);
+            SendMessageW(GetParent(hw), WM_VSCROLL,
+                         MAKEWPARAM(TB_THUMBTRACK, pos), (LPARAM)hw);
+        }
+        // The painted thumb is centered, while the native hit-test remains a
+        // few pixels left. Forward x inside the native thumb so a press on the
+        // visible edge or margin begins a real drag; vertical dragging uses y.
+        SendMessageW(hw, TBM_GETTHUMBRECT, 0, (LPARAM)&th);
+        int x = (int)(short)LOWORD(lp);
+        if (th.right > th.left) {
+            if (x < th.left) x = th.left;
+            if (x >= th.right) x = th.right - 1;
+        }
+        LRESULT result = DefSubclassProc(hw, m, wp, MAKELPARAM(x, HIWORD(lp)));
+        InvalidateRect(hw, nullptr, FALSE);
+        return result;
+    }
+    if (m == WM_LBUTTONUP || m == WM_SETFOCUS || m == WM_KILLFOCUS ||
+        m == WM_ENABLE) {
+        LRESULT result = DefSubclassProc(hw, m, wp, lp);
+        InvalidateRect(hw, nullptr, FALSE);
+        return result;
+    }
+    if (m == WM_NCDESTROY) {
+        RemovePropW(hw, L"LowCastVolumeHot");
+        RemoveWindowSubclass(hw, apvol_subclass, id);
+    }
+    return DefSubclassProc(hw, m, wp, lp);
+}
+
+static void draw_focus_ring(HDC dc, RECT rc) {
+    InflateRect(&rc, -3, -3);
+    HGDIOBJ old_pen = SelectObject(dc, g_pen_focus);
+    HGDIOBJ old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(dc, old_brush);
+    SelectObject(dc, old_pen);
+}
+
+static bool draw_dark_combo_item(const DRAWITEMSTRUCT* dis) {
+    if (!dis || dis->CtlType != ODT_COMBOBOX) return false;
+    bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    bool selected = (dis->itemState & ODS_SELECTED) != 0;
+    FillRect(dis->hDC, &dis->rcItem, selected ? g_br_checked : g_br_surface);
+    wchar_t text[512] = L"";
+    int item = dis->itemID == (UINT)-1
+        ? (int)SendMessageW(dis->hwndItem, CB_GETCURSEL, 0, 0)
+        : (int)dis->itemID;
+    if (item >= 0) SendMessageW(dis->hwndItem, CB_GETLBTEXT, item, (LPARAM)text);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, disabled ? CLR_DISABLED : CLR_TEXT);
+    HFONT font = (HFONT)SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0);
+    HGDIOBJ old_font = font ? SelectObject(dis->hDC, font) : nullptr;
+    RECT tr = dis->rcItem; tr.left += 7; tr.right -= 5;
+    DrawTextW(dis->hDC, text, -1, &tr,
+              DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (old_font) SelectObject(dis->hDC, old_font);
+    if (dis->itemState & ODS_FOCUS) draw_focus_ring(dis->hDC, dis->rcItem);
+    return true;
+}
+
+static bool draw_dark_button_item(const DRAWITEMSTRUCT* dis) {
+    if (!dis || dis->CtlType != ODT_BUTTON) return false;
+    bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+    bool focused = (dis->itemState & ODS_FOCUS) != 0;
+    bool hot = GetPropW(dis->hwndItem, L"LowCastDarkHot") != nullptr;
+    bool checked = dis->hwndItem == G.btn_beep ? g_beep_button_checked :
+                   dis->hwndItem == G.btn_localbeep ? g_localbeep_button_checked :
+                   SendMessageW(dis->hwndItem, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    HBRUSH fill = disabled ? g_br_bg : pressed ? g_br_pressed :
+                  checked ? g_br_checked : hot ? g_br_hover : g_br_surface;
+    FillRect(dis->hDC, &dis->rcItem, fill);
+    FrameRect(dis->hDC, &dis->rcItem, (checked || focused) ? g_br_checked : g_br_border);
+
+    wchar_t text[512] = L"";
+    GetWindowTextW(dis->hwndItem, text, 512);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, disabled ? CLR_DISABLED : CLR_TEXT);
+    HFONT font = (HFONT)SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0);
+    HGDIOBJ old_font = font ? SelectObject(dis->hDC, font) : nullptr;
+    RECT tr = dis->rcItem; InflateRect(&tr, -8, -2);
+    if (pressed) OffsetRect(&tr, 1, 1);
+    DrawTextW(dis->hDC, text, -1, &tr,
+              DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (old_font) SelectObject(dis->hDC, old_font);
+    if (checked) {
+        int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+        RECT mark{ dis->rcItem.left + 9, cy - 5, dis->rcItem.left + 19, cy + 5 };
+        FrameRect(dis->hDC, &mark, g_br_track);
+        HGDIOBJ old_pen = SelectObject(dis->hDC, g_pen_focus);
+        MoveToEx(dis->hDC, mark.left + 2, cy, nullptr);
+        LineTo(dis->hDC, mark.left + 4, cy + 2);
+        LineTo(dis->hDC, mark.right - 2, cy - 3);
+        SelectObject(dis->hDC, old_pen);
+    }
+    if (focused && !disabled) draw_focus_ring(dis->hDC, dis->rcItem);
+    return true;
+}
+
+// EM_REPLACESEL stops silently at the edit limit. Drop the oldest half at a
+// complete line before appending so current diagnostics and alerts stay visible.
+static void append_log_line(HWND edit, const std::wstring& text) {
+    std::wstring line = text + L"\r\n";
+    int len = GetWindowTextLengthW(edit);
+    int limit = (int)SendMessageW(edit, EM_GETLIMITTEXT, 0, 0);
+    if (len + (int)line.size() > limit) {
+        std::wstring all((size_t)len + 1, L'\0');
+        all.resize((size_t)GetWindowTextW(edit, &all[0], len + 1));
+        size_t cut = all.find(L"\r\n", all.size() / 2);
+        cut = cut == std::wstring::npos ? all.size() : cut + 2;
+        SendMessageW(edit, EM_SETSEL, 0, (LPARAM)cut);
+        SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        len = GetWindowTextLengthW(edit);
+    }
+    SendMessageW(edit, EM_SETSEL, len, len);
+    SendMessageW(edit, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
 }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_CREATE: {
         G.hwnd = h;
+        if (!g_ui_preview) g_log_hwnd.store(h);
+        init_dark_resources();
         g_font = CreateFontW(-15, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET,
                              0,0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
         g_font_big = CreateFontW(-16, 0,0,0, FW_SEMIBOLD, 0,0,0, DEFAULT_CHARSET,
                              0,0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-        g_flash_on  = CreateSolidBrush(RGB(255, 220, 40));
-        g_flash_off = CreateSolidBrush(RGB(60, 60, 66));
 
         HWND lbl1 = CreateWindowW(L"STATIC", L"Capture source (all system audio):",
                       WS_CHILD | WS_VISIBLE, 12, 10, 300, 18, h, nullptr, nullptr, nullptr);
         G.cmb_dev = CreateWindowW(L"COMBOBOX", nullptr,
-                      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED |
+                      CBS_HASSTRINGS | WS_VSCROLL,
                       12, 30, 350, 300, h, (HMENU)1, nullptr, nullptr);
-        HWND lbl2 = CreateWindowW(L"STATIC", L"Audio type (DLNA only):",
+        HWND lbl2 = CreateWindowW(L"STATIC", L"Audio type:",
                       WS_CHILD | WS_VISIBLE, 12, 66, 90, 18, h, nullptr, nullptr, nullptr);
         G.cmb_fmt = CreateWindowW(L"COMBOBOX", nullptr,
-                      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED |
+                      CBS_HASSTRINGS,
                       100, 62, 262, 200, h, (HMENU)2, nullptr, nullptr);
         G.btn_scan = CreateWindowW(L"BUTTON", L"Rescan",
-                      WS_CHILD | WS_VISIBLE, 372, 30, 118, 26, h, (HMENU)3, nullptr, nullptr);
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                      372, 30, 118, 26, h, (HMENU)3, nullptr, nullptr);
         G.btn_beep = CreateWindowW(L"BUTTON", L"Latency beep test",
-                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_PUSHLIKE,
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                       372, 62, 118, 26, h, (HMENU)4, nullptr, nullptr);
         HWND lbl3 = CreateWindowW(L"STATIC", L"Rate:",
                       WS_CHILD | WS_VISIBLE, 12, 98, 90, 18, h, nullptr, nullptr, nullptr);
         SendMessageW(lbl3, WM_SETFONT, (WPARAM)0, TRUE);
         G.cmb_rate = CreateWindowW(L"COMBOBOX", nullptr,
-                      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED |
+                      CBS_HASSTRINGS,
                       100, 94, 262, 200, h, (HMENU)6, nullptr, nullptr);
         G.btn_localbeep = CreateWindowW(L"BUTTON", L"Beep via PC out",
-                      WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_PUSHLIKE,
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                       372, 94, 118, 26, h, (HMENU)7, nullptr, nullptr);
         HWND lbl4 = CreateWindowW(L"STATIC", L"AirPlay buffer:",
-                      WS_CHILD | WS_VISIBLE, 12, 130, 90, 18, h, nullptr, nullptr, nullptr);
+                      WS_CHILD | WS_VISIBLE, 12, 130, 96, 18, h, nullptr, nullptr, nullptr);
         SendMessageW(lbl4, WM_SETFONT, (WPARAM)g_font, TRUE);
         G.cmb_aplat = CreateWindowW(L"COMBOBOX", nullptr,
-                      WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-                      100, 126, 390, 200, h, (HMENU)8, nullptr, nullptr);
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED |
+                      CBS_HASSTRINGS | WS_VSCROLL,
+                      110, 126, 380, 336, h, (HMENU)8, nullptr, nullptr);
+                      // 336: droplist tall enough for all 9 presets; VSCROLL
+                      // as a safety net so future entries can never be
+                      // scrolled out of existence again
         SendMessageW(G.cmb_aplat, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"25 ms - floor probe (loss-repair verified)");
+        SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"30 ms - very tight");
+        SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"40 ms - tight");
         SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"50 ms - insane");
         SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"75 ms - extreme");
         SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"100 ms - aggressive");
         SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"150 ms - fast");
         SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"250 ms - recommended");
+        SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"275 ms - parity (old build's 25 ms, true-latency twin)");
         SendMessageW(G.cmb_aplat, CB_ADDSTRING, 0, (LPARAM)L"350 ms - safe");
-        SendMessageW(G.cmb_aplat, CB_SETCURSEL, 4, 0);   // default 150 ms
+        SendMessageW(G.cmb_aplat, CB_SETCURSEL, 6, 0);   // default 150 ms
         // vertical volume column, right of the Rescan / beep buttons.
         // NOTE: vertical trackbars put position 0 at the TOP and report via
         // WM_VSCROLL, so displayed percent = 100 - position (up = louder).
@@ -1962,15 +3145,23 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                       500, 10, 56, 16, h, nullptr, nullptr, nullptr);
         SendMessageW(lbl5, WM_SETFONT, (WPARAM)g_font, TRUE);
         G.sld_apvol = CreateWindowW(TRACKBAR_CLASSW, nullptr,
-                      WS_CHILD | WS_VISIBLE | TBS_VERT | TBS_NOTICKS,
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_VERT | TBS_NOTICKS,
                       512, 28, 32, 96, h, (HMENU)9, nullptr, nullptr);
         SendMessageW(G.sld_apvol, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
         SendMessageW(G.sld_apvol, TBM_SETPOS, TRUE, 0);   // top = 100% / auto
+        SetWindowSubclass(G.sld_apvol, apvol_subclass, 1, 0);  // click-anywhere grab
         G.lbl_apvol = CreateWindowW(L"STATIC", L"auto",
                       WS_CHILD | WS_VISIBLE | SS_CENTER, 500, 128, 56, 18,
                       h, nullptr, nullptr, nullptr);
         SendMessageW(G.lbl_apvol, WM_SETFONT, (WPARAM)g_font, TRUE);
+        G.lbl_batt = CreateWindowW(L"STATIC", L"",     // battery: own spot, no
+                      WS_CHILD | WS_VISIBLE | SS_CENTER, 486, 148, 84, 16,
+                      h, nullptr, nullptr, nullptr);   // 84px: "bat: 100%" fits
+        SendMessageW(G.lbl_batt, WM_SETFONT, (WPARAM)g_font, TRUE);
         SendMessageW(G.cmb_dev,   CB_SETDROPPEDWIDTH, 390, 0);  // long device names
+        SendMessageW(G.cmb_fmt,   CB_SETDROPPEDWIDTH, 390, 0);
+        SendMessageW(G.cmb_rate,  CB_SETDROPPEDWIDTH, 410, 0);
+        SendMessageW(G.cmb_aplat, CB_SETDROPPEDWIDTH, 440, 0);
         G.flash = CreateWindowW(L"STATIC", L"  beep flash indicator (every 2 s) — flash\x2192tick gap = latency",
                       WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                       12, 154, 560, 26, h, (HMENU)5, nullptr, nullptr);
@@ -1982,6 +3173,17 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         for (HWND c : { lbl1, lbl2, lbl3, G.cmb_dev, G.cmb_fmt, G.cmb_rate,
                         G.btn_scan, G.btn_beep, G.btn_localbeep, G.flash, G.stat, G.log })
             SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
+        for (HWND c : { lbl1, lbl2, lbl3, lbl4, lbl5, G.cmb_dev, G.cmb_fmt,
+                        G.cmb_rate, G.cmb_aplat, G.btn_scan, G.btn_beep,
+                        G.btn_localbeep, G.sld_apvol, G.lbl_apvol, G.lbl_batt,
+                        G.flash, G.stat, G.log })
+            apply_control_dark_theme(c,
+                (c == G.cmb_dev || c == G.cmb_fmt || c == G.cmb_rate || c == G.cmb_aplat)
+                    ? L"DarkMode_CFD" : L"DarkMode_Explorer");
+        for (HWND b : { G.btn_scan, G.btn_beep, G.btn_localbeep })
+            apply_dark_button(b);
+        for (HWND c : { G.cmb_dev, G.cmb_fmt, G.cmb_rate, G.cmb_aplat })
+            apply_dark_combo(c);
 
         SendMessageW(G.cmb_rate, CB_ADDSTRING, 0, (LPARAM)L"DLNA: Native rate  (48 kHz typical)");
         SendMessageW(G.cmb_rate, CB_ADDSTRING, 0, (LPARAM)L"DLNA: 2\x00D7 upsample \x2014 halves firmware-buffer latency");
@@ -1994,17 +3196,47 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         SendMessageW(G.cmb_fmt, CB_ADDSTRING, 0, (LPARAM)L"DLNA: WAV 24-bit");
         SendMessageW(G.cmb_fmt, CB_SETCURSEL, 0, 0);
 
-        enum_render_devices();
         SendMessageW(G.cmb_dev, CB_ADDSTRING, 0, (LPARAM)L"Default output device");
-        for (auto& n : G.dev_names)
-            SendMessageW(G.cmb_dev, CB_ADDSTRING, 0, (LPARAM)n.c_str());
+        if (!g_ui_preview) {
+            enum_render_devices();
+            for (auto& n : G.dev_names)
+                SendMessageW(G.cmb_dev, CB_ADDSTRING, 0, (LPARAM)n.c_str());
+        } else {
+            SendMessageW(G.cmb_dev, CB_ADDSTRING, 0,
+                         (LPARAM)L"[PREVIEW] Mock system-audio endpoint");
+        }
         SendMessageW(G.cmb_dev, CB_SETCURSEL, 0, 0);
+
+        if (g_ui_preview) {
+            Renderer ready; ready.name = "[PREVIEW] DLNA receiver - ready";
+            Renderer disabled; disabled.name = "[PREVIEW] DLNA receiver - disabled";
+            disabled.streaming = true;
+            G.renderers.push_back(ready);
+            G.renderers.push_back(disabled);
+            AirplayDev air; air.name = "[PREVIEW] AirPlay receiver"; air.host = "127.0.0.1";
+            air.port = 5000;
+            g_airplay.push_back(air);
+            layout_renderer_buttons(h);
+            if (G.renderers.size() > 1 && G.renderers[1].button)
+                EnableWindow(G.renderers[1].button, FALSE);
+            g_localbeep_button_checked = true;
+            SendMessageW(G.btn_localbeep, BM_SETCHECK, BST_CHECKED, 0);
+            SetWindowTextW(G.stat,
+                L"UI PREVIEW ONLY - audio, discovery, HTTP and battery polling are off.\r\n"
+                L"Mock rows exercise ready, active and disabled button states.");
+            SetWindowTextW(G.log,
+                L"[preview] Safe local mock data; no streaming state or settings are written.\r\n"
+                L"[preview] Click Latency beep test to inspect subdued flash on/off colors.\r\n"
+                L"[preview] Tab through controls to inspect the low-glare focus treatment.\r\n");
+            SetFocus(G.btn_scan);
+            return 0;
+        }
 
         load_settings();                 // restore saved prefs BEFORE first capture
         SetTimer(h, IDT_STATS, 250, nullptr);
         start_capture();
-        CloseHandle(CreateThread(nullptr, 0, http_server_thread, nullptr, 0, nullptr));
-        CloseHandle(CreateThread(nullptr, 0, discover_thread, nullptr, 0, nullptr));
+        start_detached_thread(http_server_thread, L"[http] cannot create server worker");
+        start_detached_thread(discover_thread, L"[scan] cannot create discovery worker");
         ui_log(L"[app] LowCast started — zero sender buffering, TCP_NODELAY, LPCM");
         ui_log(L"[app] NOTE: DLNA has an inherent receiver-side buffer (often "
                L"several hundred ms) fixed in the device firmware — it is the "
@@ -2012,12 +3244,47 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                L"latency use the AirPlay button.");
         return 0;
     }
+    case WM_ERASEBKGND: {
+        RECT rc{}; GetClientRect(h, &rc);
+        FillRect((HDC)wp, &rc, g_br_bg);
+        return 1;
+    }
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* mi = (MEASUREITEMSTRUCT*)lp;
+        if (mi && mi->CtlType == ODT_COMBOBOX) {
+            UINT menu_h = (UINT)GetSystemMetrics(SM_CYMENU);
+            mi->itemHeight = menu_h > 22 ? menu_h : 22;
+            return TRUE;
+        }
+        break;
+    }
+    case WM_DRAWITEM:
+        if (draw_dark_button_item((DRAWITEMSTRUCT*)lp)) return TRUE;
+        if (draw_dark_combo_item((DRAWITEMSTRUCT*)lp)) return TRUE;
+        break;
     case WM_COMMAND: {
+        if (g_closing) return 0;
         int id = LOWORD(wp);
+        if ((id == 4 || id == 7) && HIWORD(wp) == BN_CLICKED) {
+            HWND toggle = id == 4 ? G.btn_beep : G.btn_localbeep;
+            bool& checked = id == 4 ? g_beep_button_checked : g_localbeep_button_checked;
+            checked = !checked;
+            SendMessageW(toggle, BM_SETCHECK,
+                         checked ? BST_CHECKED : BST_UNCHECKED, 0);
+            (void)SendMessageW(toggle, BM_GETCHECK, 0, 0); // keep native state mirrored
+            InvalidateRect(toggle, nullptr, FALSE);
+        }
+        if (g_ui_preview) {
+            if (id == 4 && HIWORD(wp) == BN_CLICKED) {
+                G.flash_state = g_beep_button_checked;
+                InvalidateRect(G.flash, nullptr, TRUE);
+            }
+            return 0; // safe preview: never start capture, discovery or a receiver
+        }
         if (id == 3 && HIWORD(wp) == BN_CLICKED) {           // rescan
-            CloseHandle(CreateThread(nullptr, 0, discover_thread, nullptr, 0, nullptr));
+            start_detached_thread(discover_thread, L"[scan] cannot create discovery worker");
         } else if (id == 4 && HIWORD(wp) == BN_CLICKED) {    // beep test toggle
-            bool on = SendMessageW(G.btn_beep, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            bool on = g_beep_button_checked;
             G.beep_on.store(on);
             ui_log(on ? L"[test] metronome ON — 1 kHz tick every 2 s; latency = flash\x2192sound gap"
                       : L"[test] metronome OFF");
@@ -2028,13 +3295,18 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             start_capture();
         } else if (id == 8 && HIWORD(wp) == CBN_SELCHANGE) { // AirPlay buffer
             int sel = (int)SendMessageW(G.cmb_aplat, CB_GETCURSEL, 0, 0);
-            if (sel >= 0 && sel < 7) G.ap_latency_ms.store(g_ap_lats[sel]);
+            if (sel >= 0 && sel < 10) G.ap_latency_ms.store(g_ap_lats[sel]);
             ui_log(L"[raop] buffer changed \x2014 takes effect on next AirPlay START");
         } else if (id == 7 && HIWORD(wp) == BN_CLICKED) {   // local beep toggle
-            bool on = SendMessageW(G.btn_localbeep, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            bool on = g_localbeep_button_checked;
             bool was = G.beep_local.exchange(on);
-            if (on && !was)
-                CloseHandle(CreateThread(nullptr, 0, local_beep_thread, nullptr, 0, nullptr));
+            if (on && !was && !start_detached_thread(
+                    local_beep_thread, L"[test] cannot create local beep worker")) {
+                G.beep_local.store(false);
+                g_localbeep_button_checked = false;
+                SendMessageW(G.btn_localbeep, BM_SETCHECK, BST_UNCHECKED, 0);
+                InvalidateRect(G.btn_localbeep, nullptr, FALSE);
+            }
             if (!on) ui_log(L"[test] local beep off");
         } else if (id == 6 && HIWORD(wp) == CBN_SELCHANGE) { // upsample rate
             int sel = (int)SendMessageW(G.cmb_rate, CB_GETCURSEL, 0, 0);
@@ -2049,36 +3321,75 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             ui_log(L"[audio] format changed — active streams closed; press START again");
         } else if (id >= IDC_RENDER_BASE + 1000 && HIWORD(wp) == BN_CLICKED) {
             int idx = id - (IDC_RENDER_BASE + 1000);
+            AirplayDev target;
             EnterCriticalSection(&G.cs);
-            bool valid = idx < (int)g_airplay.size();
-            bool was = valid ? g_airplay[idx].streaming : false;
-            std::string host = valid ? g_airplay[idx].host : "";
-            int port = valid ? g_airplay[idx].port : 0;
-            if (valid) g_airplay[idx].streaming = !was;
+            bool valid = idx >= 0 && idx < (int)g_airplay_button_targets.size();
+            bool was = false;
+            std::string host;
+            int port = 0;
+            if (valid) {
+                target = g_airplay_button_targets[idx];
+                valid = false;
+                for (auto& device : g_airplay) {
+                    if (device.host == target.host && device.port == target.port) {
+                        was = device.streaming;
+                        host = device.host;
+                        port = device.port;
+                        device.streaming = !was;
+                        valid = true;
+                        break;
+                    }
+                }
+            }
             LeaveCriticalSection(&G.cs);
             if (valid) {
                 if (was) raop_stop();
                 else {
-                    stop_dlna_to_host(host);
-                    raop_start(host, port, (uint32_t)G.ap_latency_ms.load());
+                    // Refuse BEFORE touching this host's DLNA stream: raop_start
+                    // declines when another session is live (or the previous one
+                    // is still closing), and the optimistic flag must then be
+                    // undone, or this button shows STOP and its next click kills
+                    // the OTHER receiver's live session.
+                    bool ok = !raop_is_running();
+                    if (!ok) ui_log(L"[raop] an AirPlay session is already live \x2014 stop it first");
+                    else ok = raop_start(host, port, (uint32_t)G.ap_latency_ms.load());
+                    // (raop_start ends this host's DLNA stream itself, and only
+                    // once it knows it will start: its "previous session still
+                    // closing" refusal must not cost the host that stream.)
+                    if (!ok) {
+                        EnterCriticalSection(&G.cs);
+                        for (auto& device : g_airplay)
+                            if (device.host == host && device.port == port)
+                                device.streaming = false;
+                        LeaveCriticalSection(&G.cs);
+                    }
                 }
                 PostMessageW(G.hwnd, WM_APP_RENDERS, 1, 0);
             }
         } else if (id >= IDC_RENDER_BASE && HIWORD(wp) == BN_CLICKED) {
             int idx = id - IDC_RENDER_BASE;
+            Renderer target;
             EnterCriticalSection(&G.cs);
-            bool valid = idx < (int)G.renderers.size();
-            bool was = valid ? G.renderers[idx].streaming : false;
-            if (valid && G.renderers[idx].button)
-                EnableWindow(G.renderers[idx].button, FALSE);
+            bool valid = idx >= 0 && idx < (int)g_dlna_button_targets.size();
+            bool was = false;
+            if (valid) {
+                target = g_dlna_button_targets[idx];
+                valid = false;
+                for (const auto& renderer : G.renderers) {
+                    if (same_renderer(renderer, target)) {
+                        target = renderer;
+                        was = renderer.streaming;
+                        valid = true;
+                        break;
+                    }
+                }
+            }
+            if (valid) EnableWindow((HWND)lp, FALSE);
             LeaveCriticalSection(&G.cs);
             if (valid) {
                 if (!was && raop_is_running()) {
                     // symmetric: don't start DLNA while AirPlay owns a device
-                    std::string ah;
-                    EnterCriticalSection(&G.cs);
-                    ah = G.renderers[idx].host;
-                    LeaveCriticalSection(&G.cs);
+                    std::string ah = target.host;
                     bool conflict = false;
                     EnterCriticalSection(&G.cs);
                     for (auto& d : g_airplay)
@@ -2093,18 +3404,21 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                         Sleep(600);
                     }
                 }
-                CastJob* job = new CastJob{ idx, !was };
-                CloseHandle(CreateThread(nullptr, 0, cast_thread, job, 0, nullptr));
+                CastJob* job = new CastJob{ target, !was };
+                HANDLE worker = CreateThread(nullptr, 0, cast_thread, job, 0, nullptr);
+                if (worker) CloseHandle(worker);
+                else {
+                    delete job;
+                    EnableWindow((HWND)lp, TRUE);
+                    ui_log(L"[cast] cannot create DLNA control worker");
+                }
             }
         }
         return 0;
     }
     case WM_APP_LOG: {
         std::wstring* s = (std::wstring*)lp;
-        int len = GetWindowTextLengthW(G.log);
-        SendMessageW(G.log, EM_SETSEL, len, len);
-        std::wstring line = *s + L"\r\n";
-        SendMessageW(G.log, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+        append_log_line(G.log, *s);
         delete s;
         return 0;
     }
@@ -2112,6 +3426,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (wp == 2) { // format auto-fallback happened: reflect it in the UI
             SendMessageW(G.cmb_fmt, CB_SETCURSEL, G.fmt.load(), 0);
             ui_log(L"[audio] format switched automatically (renderer compatibility)");
+            return 0;
+        }
+        if (wp == 3) { // the fallback was rejected as well: format restored
+            SendMessageW(G.cmb_fmt, CB_SETCURSEL, G.fmt.load(), 0);
+            ui_log(L"[audio] fallback rejected \x2014 format restored");
             return 0;
         }
         if (wp == 1) { // just relabel + re-enable
@@ -2143,7 +3462,16 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         SetTimer(h, IDT_FLASHOFF, 120, nullptr);
         return 0;
     case WM_TIMER:
-        if (wp == IDT_STATS) update_stats();
+        if (wp == IDT_SHUTDOWN) {
+            // A pending driver/connect is owned until it finishes. Do not
+            // destroy globals beneath it or repeatedly block the UI polling.
+            bool cap_done = !g_capture_handle || WaitForSingleObject(g_capture_handle, 0) == WAIT_OBJECT_0;
+            if (cap_done && raop_stop(true) && stop_capture()) {
+                KillTimer(h, IDT_SHUTDOWN);
+                DestroyWindow(h);
+            }
+        }
+        else if (wp == IDT_STATS) update_stats();
         else if (wp == IDT_FLASHOFF) {
             KillTimer(h, IDT_FLASHOFF);
             G.flash_state = false;
@@ -2154,11 +3482,28 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if ((HWND)lp == G.flash) {
             HDC dc = (HDC)wp;
             SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, G.flash_state ? RGB(0,0,0) : RGB(200,200,200));
-            return (LRESULT)(G.flash_state ? g_flash_on : g_flash_off);
+            SetTextColor(dc, G.flash_state ? CLR_FLASH_TXT : CLR_TEXT);
+            return (LRESULT)(G.flash_state ? g_br_flash_on : g_br_surface);
         }
-        break;
+        SetBkMode((HDC)wp, TRANSPARENT);
+        SetTextColor((HDC)wp,
+                     ((HWND)lp == G.stat || (HWND)lp == G.lbl_batt)
+                         ? CLR_SECONDARY : CLR_TEXT);
+        return (LRESULT)g_br_bg;
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wp, CLR_SURFACE);
+        SetTextColor((HDC)wp, CLR_TEXT);
+        return (LRESULT)g_br_surface;
+    case WM_CTLCOLORLISTBOX:
+        SetBkColor((HDC)wp, CLR_SURFACE);
+        SetTextColor((HDC)wp, CLR_TEXT);
+        return (LRESULT)g_br_surface;
+    case WM_CTLCOLORBTN:
+        SetBkColor((HDC)wp, CLR_SURFACE);
+        SetTextColor((HDC)wp, CLR_TEXT);
+        return (LRESULT)g_br_surface;
     case WM_VSCROLL:
+        if (g_closing) return 0;
         if ((HWND)lp == G.sld_apvol) {
             int pos = (int)SendMessageW(G.sld_apvol, TBM_GETPOS, 0, 0);
             int pct = 100 - pos;                  // vertical: top = 100%
@@ -2166,16 +3511,50 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             swprintf(vt, 16, L"%d%%", pct);
             SetWindowTextW(G.lbl_apvol, vt);      // moving readout while dragging
             G.ap_start_vol.store(pct);
-            // apply on release / arrow / page step; TB_THUMBTRACK is the drag
-            // itself (the liveness thread coalesces pushes anyway)
-            if (LOWORD(wp) != TB_THUMBTRACK && raop_is_running())
+            if (raop_is_running()) {
+                // TACTILE: every thumb movement queues a push, so the audio
+                // level follows the drag in real time. The liveness thread
+                // coalesces the flood to <=10 commands/s over RTSP.
                 raop_push_volume(pct);
+                if (LOWORD(wp) == TB_ENDTRACK) {  // one summary line at rest
+                    wchar_t fl[48];
+                    swprintf(fl, 48, L"[raop] volume: %d%%", pct);
+                    ui_log(fl);
+                }
+            }
         }
         return 0;
+    case WM_CLOSE: {
+        if (g_closing) return 0;
+        g_closing = true;
+        if (g_ui_preview) {
+            DestroyWindow(h);
+            return 0;
+        }
+        g_battery_alert.shutting_down = true;
+        bool ra_done = raop_stop(true);
+        bool cap_done = stop_capture();
+        if (ra_done && cap_done) DestroyWindow(h);
+        else {
+            SetWindowTextW(h, L"LowCast - closing audio and network workers...");
+            ui_log(L"[app] closing: waiting for audio/network workers to release their resources");
+            if (!SetTimer(h, IDT_SHUTDOWN, 250, nullptr)) {
+                // Resource-exhaustion fallback: preserve ownership even if a
+                // timer cannot be created. Ordinary shutdown stays responsive.
+                while (!raop_stop(true) || !stop_capture()) Sleep(100);
+                DestroyWindow(h);
+            }
+        }
+        return 0;
+    }
     case WM_DESTROY:
-        save_settings(h);
-        raop_stop();                     // graceful TEARDOWN (was: process kill
-        stop_capture();                  // left the receiver holding the session)
+        battery_alert_shutdown(g_battery_alert);
+        g_log_hwnd.store(nullptr);
+        if (!g_ui_preview) {
+            save_settings(h);
+            raop_stop(true);             // graceful TEARDOWN (was: process kill
+            stop_capture();              // left the receiver holding the session)
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -2190,13 +3569,26 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 // ===========================================================================
 
 static uint64_t ntp_now() {                       // 64-bit NTP timestamp
-    FILETIME ft; GetSystemTimeAsFileTime(&ft);
-    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime; // 100ns since 1601
-    // seconds between 1601 and 1900 epochs
-    const uint64_t EPOCH_DELTA = 9435484800ULL;
-    uint64_t secs = t / 10000000ULL - EPOCH_DELTA;
-    uint32_t frac = (uint32_t)((t % 10000000ULL) * 4294967296ULL / 10000000ULL);
-    return (secs << 32) | frac;
+    // Anchored ONCE to the wall clock (from wWinMain, single-threaded), then
+    // advanced by the monotonic clock. The receiver only needs our sync and
+    // timing-reply timestamps to be mutually consistent, never true wall time.
+    // Reading the wall clock per call let a Windows Time step (event log:
+    // -1239 ms at 2026-09-04 23:15:45) shift every later sync by that much,
+    // which derailed the receiver until the session was restarted by hand.
+    static uint64_t base_ntp = 0, base_mono = 0;
+    if (!base_ntp) {
+        FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
+        base_mono = mono_100ns();
+        uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime; // 100ns since 1601
+        const uint64_t EPOCH_DELTA = 9435484800ULL;                        // 1601 -> 1900
+        uint64_t secs = t / 10000000ULL - EPOCH_DELTA;
+        uint32_t frac = (uint32_t)((t % 10000000ULL) * 4294967296ULL / 10000000ULL);
+        base_ntp = (secs << 32) | frac;
+    }
+    uint64_t d = mono_100ns() - base_mono;                      // 100 ns since anchor
+    uint64_t dsec = d / 10000000ULL;
+    uint64_t dfrac = ((d % 10000000ULL) << 32) / 10000000ULL;  // < 2^32
+    return base_ntp + (dsec << 32) + dfrac;                     // carry is natural
 }
 
 struct BitWriter {
@@ -2262,32 +3654,88 @@ static const char* stable_client_id() {
 
 struct RtspConn {
     SOCKET s = INVALID_SOCKET;
-    int cseq = 0;
+    uint32_t cseq = 0;
     bool last_send_failed = false;
-    // Discard bytes left over from replies that arrived after a recv timeout,
-    // so a stalled round-trip cannot desync request/response pairing.
-    void drain() {
-        if (s == INVALID_SOCKET) return;
-        u_long avail = 0; char tmp[512];
-        while (ioctlsocket(s, FIONREAD, &avail) == 0 && avail > 0) {
-            int n = recv(s, tmp, sizeof(tmp), 0);
-            if (n <= 0) break;
+    std::string pending;
+    static constexpr size_t MAX_RESPONSE = 64 * 1024;
+    // Retain incomplete replies across timeouts. Only a complete, matching
+    // CSeq can answer a request; blindly draining TCP loses framing.
+    int extract_response(std::string& response, uint32_t& response_cseq) {
+        size_t he = pending.find("\r\n\r\n");
+        if (he == std::string::npos) return pending.size() >= MAX_RESPONSE ? -1 : 0;
+        size_t first = pending.find("\r\n");
+        if (first == std::string::npos || first < 12 ||
+            pending.compare(0, 9, "RTSP/1.0 ") != 0 ||
+            pending[9] < '0' || pending[9] > '9' ||
+            pending[10] < '0' || pending[10] > '9' ||
+            pending[11] < '0' || pending[11] > '9' ||
+            (first > 12 && pending[12] != ' ')) return -1;
+        uint64_t blen = 0, seq = 0;
+        bool have_seq = false, have_length = false;
+        for (size_t p = first + 2; p < he;) {
+            size_t end = pending.find("\r\n", p);
+            if (end == std::string::npos || end > he) return -1;
+            size_t colon = pending.find(':', p);
+            if (colon == std::string::npos || colon >= end) return -1;
+            std::string key = pending.substr(p, colon - p);
+            bool is_seq = ifind(key, "cseq") == 0 && key.size() == 4;
+            bool is_length = ifind(key, "content-length") == 0 && key.size() == 14;
+            if (is_seq || is_length) {
+                if ((is_seq && have_seq) || (is_length && have_length)) return -1;
+                size_t q = colon + 1;
+                while (q < end && (pending[q] == ' ' || pending[q] == '\t')) ++q;
+                size_t digits = q;
+                uint64_t value = 0, limit = is_seq ? UINT32_MAX : MAX_RESPONSE;
+                while (q < end && pending[q] >= '0' && pending[q] <= '9') {
+                    unsigned digit = pending[q++] - '0';
+                    if (value > (limit - digit) / 10) return -1;
+                    value = value * 10 + digit;
+                }
+                if (q == digits) return -1;
+                while (q < end && (pending[q] == ' ' || pending[q] == '\t')) ++q;
+                if (q != end) return -1;
+                if (is_seq) { seq = value; have_seq = true; }
+                else { blen = value; have_length = true; }
+            }
+            p = end + 2;
         }
+        if (!have_seq || he + 4 > MAX_RESPONSE || blen > MAX_RESPONSE - (he + 4)) return -1;
+        size_t total = he + 4 + (size_t)blen;
+        if (pending.size() < total) return 0;
+        response.assign(pending, 0, total);
+        pending.erase(0, total);
+        response_cseq = (uint32_t)seq;
+        return 1;
     }
     std::string session, ua = "iTunes/7.6.2 (Windows; N;)", cid;
     std::string uri;
     bool open(const std::string& host, int port) {
+        pending.clear();
         s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return false;
         DWORD tmo = 5000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tmo, sizeof(tmo));
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port);
         if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) {
             addrinfo hints{}, *res = nullptr; hints.ai_family = AF_INET;
-            if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return false;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) {
+                closesocket(s); s = INVALID_SOCKET;   // no handle leak per retry
+                return false;
+            }
             a.sin_addr = ((sockaddr_in*)res->ai_addr)->sin_addr;
             freeaddrinfo(res);
         }
-        if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) return false;
+        // Plain BLOCKING connect — deliberately. A non-blocking connect +
+        // select was tried twice (3 s and 8 s deadlines) and never completed
+        // on this system even with the receiver provably awake, while this
+        // path connects in milliseconds. Something in the local Winsock
+        // layering does not honor non-blocking connect semantics; do not
+        // reintroduce it without testing on THIS machine.
+        if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) {
+            closesocket(s); s = INVALID_SOCKET;       // no handle leak on failure
+            return false;
+        }
         cid = stable_client_id();
         return true;
     }
@@ -2297,7 +3745,7 @@ struct RtspConn {
                         bool* ok_out = nullptr) {
         char hdr[1024];
         snprintf(hdr, sizeof(hdr),
-                 "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: %s\r\n"
+                 "%s %s RTSP/1.0\r\nCSeq: %u\r\nUser-Agent: %s\r\n"
                  "Client-Instance: %s\r\nDACP-ID: %s\r\n%s%s%s"
                  "Content-Length: %zu\r\n\r\n",
                  method, ruri.c_str(), ++cseq, ua.c_str(), cid.c_str(), cid.c_str(),
@@ -2306,27 +3754,44 @@ struct RtspConn {
                  body.size());
         std::string req = std::string(hdr) + body;
         last_send_failed = false;
-        drain();
-        if (!send_all(s, req.data(), (int)req.size())) {
-            last_send_failed = true;
-            if (ok_out) *ok_out = false; return {};
+        if (ok_out) *ok_out = false;
+        // The budget covers the entire exchange, including partial sends and
+        // stale replies. A trickle cannot renew a five-second recv timeout.
+        ULONGLONG deadline = GetTickCount64() + 5000;
+        for (size_t sent = 0; sent < req.size();) {
+            ULONGLONG tick = GetTickCount64();
+            if (tick >= deadline) { last_send_failed = true; return {}; }
+            DWORD remaining = (DWORD)(deadline - tick);
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&remaining, sizeof(remaining));
+            int n = send(s, req.data() + sent, (int)(req.size() - sent), 0);
+            if (n <= 0) { last_send_failed = true; return {}; }
+            sent += (size_t)n;
         }
         std::string resp; char buf[2048];
-        long long want = -1;
+        bool matched = false;
         while (true) {
-            size_t he = resp.find("\r\n\r\n");
-            if (he != std::string::npos && want < 0) {
-                size_t cl = ifind(resp, "content-length:");
-                long long blen = 0;
-                if (cl != std::string::npos && cl < he) blen = atoll(resp.c_str() + cl + 15);
-                want = (long long)(he + 4) + blen;
+            ULONGLONG tick = GetTickCount64();
+            if (tick >= deadline) break;
+            uint32_t reply_seq = 0;
+            int framed = extract_response(resp, reply_seq);
+            if (framed < 0) { last_send_failed = true; pending.clear(); break; }
+            if (framed > 0) {
+                if (reply_seq == cseq) { matched = true; break; }
+                resp.clear(); // complete delayed reply belongs to an older request
+                continue;
             }
-            if (want >= 0 && (long long)resp.size() >= want) break;
-            int n = recv(s, buf, sizeof(buf), 0);
-            if (n <= 0) break;
-            resp.append(buf, n);
+            DWORD remaining = (DWORD)(deadline - tick);
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&remaining, sizeof(remaining));
+            int capacity = (int)(MAX_RESPONSE - pending.size());
+            int n = recv(s, buf, capacity < (int)sizeof(buf) ? capacity : (int)sizeof(buf), 0);
+            if (n <= 0) {
+                if (n == 0 || WSAGetLastError() != WSAETIMEDOUT) last_send_failed = true;
+                break;
+            }
+            pending.append(buf, n);
         }
-        bool ok = resp.rfind("RTSP/1.0 200", 0) == 0;
+        if (!matched) resp.clear();
+        bool ok = matched && resp.compare(0, 12, "RTSP/1.0 200") == 0;
         if (g_console_mode) {
             size_t e = resp.find("\r\n");
             std::string status = (e == std::string::npos) ? "(no response)" : resp.substr(0, e);
@@ -2341,7 +3806,7 @@ struct RtspConn {
         if (ok_out) *ok_out = ok;
         return resp;
     }
-    void close() { if (s != INVALID_SOCKET) closesocket(s); s = INVALID_SOCKET; }
+    void close() { if (s != INVALID_SOCKET) closesocket(s); s = INVALID_SOCKET; pending.clear(); }
 };
 
 static std::string rtsp_header(const std::string& resp, const char* name) {
@@ -2366,6 +3831,7 @@ struct RaopSession {
     std::atomic<uint64_t> last_timing_ms{0};     // receiver heartbeat (0xD2 seen)
     std::atomic<uint32_t> reconnects{0};
     HANDLE thread = nullptr, tim_thread = nullptr, ctrl_thread = nullptr;
+    std::atomic<bool> udp_run{false}; // sockets remain unchanged until both workers join
     // liveness thread: owns keepalive/probe so the TRANSMIT loop never blocks
     // on RTSP I/O. rtsp_cs guards RtspConn between liveness and reconnect.
     HANDLE ka_thread = nullptr;
@@ -2377,62 +3843,181 @@ struct RaopSession {
     // retransmit history: last 1024 RTP packets (~8 s), guarded by hist_cs
     CRITICAL_SECTION hist_cs;
     std::vector<uint8_t> hist[1024];
+    uint64_t hist_ts[1024] = {};              // send time per slot (hist_cs)
+    // worst resend-request age this session: a DIRECT measurement of the
+    // buffer the receiver needed for that loss repair to be useful
+    std::atomic<uint32_t> hw_resend_age{0};
+    std::atomic<uint32_t> hw_depth_ms{0};     // session-worst pipe depth (ms)
+    std::atomic<uint64_t> sess_t0{0};         // session start (soak gate)
 };
 static RaopSession RA;
 
 // Tag a UDP flow as voice traffic (DSCP EF) so WiFi WMM gives it airtime
 // priority. Dynamic-loaded; silently skipped where qWave is unavailable.
+static constexpr int QOS_VOICE_TRAFFIC_TYPE = 4;
+using QosAddSocket = BOOL (WINAPI *)(HANDLE, SOCKET, sockaddr*, int, DWORD, UINT32*);
+static bool qos_assign_voice(QosAddSocket add, HANDLE handle, SOCKET s,
+                             const sockaddr_in& dst, DWORD& error) {
+    UINT32 flow = 0;
+    if (add(handle, s, (sockaddr*)&dst, QOS_VOICE_TRAFFIC_TYPE, 2, &flow)) {
+        error = ERROR_SUCCESS;
+        return true;
+    }
+    error = GetLastError();
+    // A null destination is valid only for an already connected socket.
+    sockaddr_in peer{}; int length = sizeof(peer);
+    if (getpeername(s, (sockaddr*)&peer, &length) == 0) {
+        flow = 0;
+        if (add(handle, s, nullptr, QOS_VOICE_TRAFFIC_TYPE, 2, &flow)) {
+            error = ERROR_SUCCESS;
+            return true;
+        }
+        error = GetLastError();
+    }
+    return false;
+}
 static void qos_tag_voice(SOCKET s, const sockaddr_in& dst) {
     // minimal qWave declarations (mingw's qos2.h is broken)
     struct QOS_VERSION { USHORT MajorVersion, MinorVersion; };
     typedef UINT32 QOS_FLOWID;
-    enum { QOSTrafficTypeVoice_ = 6, QOS_NON_ADAPTIVE_FLOW_ = 0x00000002 };
     typedef BOOL (WINAPI *PQOSCreateHandle)(QOS_VERSION*, PHANDLE);
     typedef BOOL (WINAPI *PQOSAddSocketToFlow)(HANDLE, SOCKET, sockaddr*,
                                                int, DWORD, QOS_FLOWID*);
-    static HANDLE qh = nullptr;
-    static PQOSAddSocketToFlow pAdd = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
+    struct Api { HANDLE handle = nullptr; PQOSAddSocketToFlow add = nullptr;
+                 DWORD error = ERROR_PROC_NOT_FOUND; };
+    static const Api api = [] {
+        Api result;
         HMODULE m = LoadLibraryW(L"qwave.dll");
         if (m) {
             PQOSCreateHandle pCreate = (PQOSCreateHandle)GetProcAddress(m, "QOSCreateHandle");
-            pAdd = (PQOSAddSocketToFlow)GetProcAddress(m, "QOSAddSocketToFlow");
+            result.add = (PQOSAddSocketToFlow)GetProcAddress(m, "QOSAddSocketToFlow");
             QOS_VERSION v{ 1, 0 };
-            if (!pCreate || !pCreate(&v, &qh)) { qh = nullptr; pAdd = nullptr; }
+            if (pCreate && result.add) {
+                if (pCreate(&v, &result.handle)) result.error = ERROR_SUCCESS;
+                else result.error = GetLastError();
+            }
+        } else {
+            result.error = GetLastError();
         }
-        ui_log(qh ? L"[net] QoS voice tagging active (DSCP EF / WMM priority)"
-                  : L"[net] QoS tagging unavailable — continuing untagged");
+        return result;
+    }();
+    DWORD error = api.error;
+    bool ok = api.handle && api.add && qos_assign_voice(api.add, api.handle, s, dst, error);
+    char address[INET_ADDRSTRLEN]{};
+    inet_ntop(AF_INET, &dst.sin_addr, address, sizeof(address));
+    wchar_t line[256];
+    swprintf(line, 256, L"[net] QoS voice flow %ls for %hs:%u; error=%lu "
+             L"(API acceptance does not confirm router priority)",
+             ok ? L"accepted" : L"FAILED", address, (unsigned)ntohs(dst.sin_port), error);
+    ui_log(line);
+}
+
+// Fixed, lock-free counters; no formatting/allocation/logging on send paths.
+enum class UdpKind { Audio, Duplicate, Resend, Timing, Sync, Count };
+static constexpr int UDP_ERRORS[] = {WSAEWOULDBLOCK, WSAENOBUFS, WSAEMSGSIZE,
+    WSAENETUNREACH, WSAEHOSTUNREACH, WSAENOTSOCK, WSAETIMEDOUT};
+struct UdpSendStats {
+    std::atomic<uint64_t> ok{0}, failed{0}, short_send{0}, max_ms{0};
+    std::atomic<int> last_error{0};
+    std::atomic<uint64_t> errors[8]{}; // seven named codes plus other
+};
+static UdpSendStats g_udp_stats[(int)UdpKind::Count];
+static bool record_udp_result(UdpSendStats& stats, int length, int sent,
+                               int error, uint64_t elapsed) {
+    uint64_t old = stats.max_ms.load(std::memory_order_relaxed);
+    while (old < elapsed && !stats.max_ms.compare_exchange_weak(
+               old, elapsed, std::memory_order_relaxed)) {}
+    if (sent == length) {
+        stats.ok.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
-    if (qh && pAdd) {
-        QOS_FLOWID fid = 0;
-        if (!pAdd(qh, s, (sockaddr*)&dst, QOSTrafficTypeVoice_, QOS_NON_ADAPTIVE_FLOW_, &fid)) {
-            // connected sockets (the DLNA TCP stream) want a NULL dest addr
-            fid = 0;
-            pAdd(qh, s, nullptr, QOSTrafficTypeVoice_, QOS_NON_ADAPTIVE_FLOW_, &fid);
+    stats.failed.fetch_add(1, std::memory_order_relaxed);
+    if (sent == SOCKET_ERROR) {
+        stats.last_error.store(error, std::memory_order_relaxed);
+        int bucket = 7;
+        for (int i = 0; i < 7; ++i) if (UDP_ERRORS[i] == error) { bucket = i; break; }
+        stats.errors[bucket].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        stats.short_send.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+}
+static bool diagnosed_udp_send(UdpKind kind, SOCKET s, const char* data, int length,
+                                const sockaddr* destination, int address_length) {
+    static const uint64_t frequency = [] {
+        LARGE_INTEGER value{}; QueryPerformanceFrequency(&value);
+        return (uint64_t)value.QuadPart;
+    }();
+    LARGE_INTEGER start{}, end{}; QueryPerformanceCounter(&start);
+    int sent = sendto(s, data, length, 0, destination, address_length);
+    int error = sent == SOCKET_ERROR ? WSAGetLastError() : 0;
+    QueryPerformanceCounter(&end);
+    return record_udp_result(g_udp_stats[(int)kind], length, sent, error,
+                             (uint64_t)(end.QuadPart - start.QuadPart) * 1000 / frequency);
+}
+static void report_udp_sends() {
+    static const wchar_t* names[] = {L"audio", L"duplicate", L"resend", L"timing", L"sync"};
+    for (int k = 0; k < (int)UdpKind::Count; ++k) {
+        auto& stats = g_udp_stats[k];
+        uint64_t ok = stats.ok.exchange(0), failed = stats.failed.exchange(0);
+        uint64_t short_send = stats.short_send.exchange(0), max_ms = stats.max_ms.exchange(0);
+        int last_error = stats.last_error.exchange(0);
+        std::wstring errors;
+        for (int i = 0; i < 8; ++i) {
+            uint64_t count = stats.errors[i].exchange(0);
+            if (count) {
+                wchar_t item[64];
+                swprintf(item, 64, L" %d:%llu", i == 7 ? -1 : UDP_ERRORS[i],
+                         (unsigned long long)count);
+                errors += item;
+            }
         }
+        if (!ok && !failed && !max_ms && errors.empty()) continue;
+        wchar_t line[512];
+        swprintf(line, 512, L"[send] %ls: ok=%llu failed=%llu short=%llu "
+                 L"max_ms=%llu last_wsa=%d errors{%ls}", names[k],
+                 (unsigned long long)ok, (unsigned long long)failed,
+                 (unsigned long long)short_send, (unsigned long long)max_ms,
+                 last_error, errors.c_str());
+        ui_log(line);
     }
 }
 
 static int bind_udp(SOCKET& s) {
-    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKET n = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (n == INVALID_SOCKET) return 0;
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = 0;
-    bind(s, (sockaddr*)&a, sizeof(a));
+    if (bind(n, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(n); return 0; }
+    DWORD tmo = 500;                 // reader threads re-check RA.run every 500 ms.
+    if (setsockopt(n, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo)) != 0 ||
+        setsockopt(n, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tmo, sizeof(tmo)) != 0) {
+        closesocket(n); return 0;
+    }
     sockaddr_in me{}; int ml = sizeof(me);
-    getsockname(s, (sockaddr*)&me, &ml);
-    return ntohs(me.sin_port);
+    if (getsockname(n, (sockaddr*)&me, &ml) != 0) { closesocket(n); return 0; }
+    s = n;                           // publish only once fully configured: a reader
+    return ntohs(me.sin_port);       // must never pick up a socket with no timeout
+}
+// Called only after workers have joined; no cached socket can outlive its owner.
+static void close_udp(SOCKET& s) {
+    SOCKET old = s;
+    s = INVALID_SOCKET;
+    if (old != INVALID_SOCKET) closesocket(old);
 }
 
 static DWORD WINAPI raop_timing_thread(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     // answer NTP timing requests (type 0xD2) with 0xD3 replies
     char buf[64];
-    DWORD tmo = 500;
-    setsockopt(RA.tim_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
-    while (RA.run.load()) {
+    const SOCKET s = RA.tim_sock;
+    while (RA.run.load() && RA.udp_run.load()) {
         sockaddr_in from{}; int fl = sizeof(from);
-        int n = recvfrom(RA.tim_sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+        int n = recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+        if (!RA.udp_run.load() || !RA.run.load()) break;
+        if (n < 0) {                 // 500 ms timeout is the normal idle path;
+            if (WSAGetLastError() != WSAETIMEDOUT) Sleep(20);   // anything else
+            continue;                // (socket closed under us): never spin
+        }
         if (n < 32) continue;
         if ((uint8_t)buf[1] != 0xD2) continue;
         {
@@ -2454,7 +4039,7 @@ static DWORD WINAPI raop_timing_thread(LPVOID) {
             rep[16 + i] = (uint8_t)(now >> (56 - 8 * i));
             rep[24 + i] = (uint8_t)(now >> (56 - 8 * i));   // transmit time
         }
-        sendto(RA.tim_sock, (const char*)rep, 32, 0, (sockaddr*)&from, fl);
+        diagnosed_udp_send(UdpKind::Timing, s, (const char*)rep, 32, (sockaddr*)&from, fl);
     }
     return 0;
 }
@@ -2462,45 +4047,80 @@ static DWORD WINAPI raop_timing_thread(LPVOID) {
 static DWORD WINAPI raop_control_thread(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     char buf[64];
-    DWORD tmo = 500;
-    setsockopt(RA.ctrl_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
-    sockaddr_in dst{}; dst.sin_family = AF_INET; dst.sin_port = htons((u_short)RA.srv_ctrl);
-    inet_pton(AF_INET, RA.host.c_str(), &dst.sin_addr);
-    while (RA.run.load()) {
+    const SOCKET s = RA.ctrl_sock;
+    // Replies go to the request's source address: shairport-sync sends 0xD5 from
+    // its control socket, so `from` is always the CURRENT control port, even after
+    // a reconnect re-SETUPs onto different ports (a dst cached here went stale and
+    // every retransmit then hit a dead port while still counting as sent).
+    while (RA.run.load() && RA.udp_run.load()) {
         sockaddr_in from{}; int fl = sizeof(from);
-        int n = recvfrom(RA.ctrl_sock, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+        int n = recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
+        if (!RA.udp_run.load() || !RA.run.load()) break;
+        if (n < 0) {
+            if (WSAGetLastError() != WSAETIMEDOUT) Sleep(20);
+            continue;
+        }
         if (n < 8) continue;
         if ((uint8_t)buf[1] != 0xD5) continue;   // resend request
         uint16_t first = ((uint8_t)buf[4] << 8) | (uint8_t)buf[5];
         uint16_t count = ((uint8_t)buf[6] << 8) | (uint8_t)buf[7];
         if (count > 128) count = 128;
         for (uint16_t i = 0; i < count; ++i) {
+            if (!RA.udp_run.load() || !RA.run.load()) break;
             uint16_t want = (uint16_t)(first + i);
             std::vector<uint8_t> pkt;
+            uint64_t sent_at = 0;
             EnterCriticalSection(&RA.hist_cs);
             std::vector<uint8_t>& h = RA.hist[want & 1023];
             if (h.size() > 4 &&
-                ((h[2] << 8) | h[3]) == want)     // seq matches: still in history
+                ((h[2] << 8) | h[3]) == want) {   // seq matches: still in history
                 pkt = h;
+                sent_at = RA.hist_ts[want & 1023];
+            }
             LeaveCriticalSection(&RA.hist_cs);
             if (pkt.empty()) continue;
+            if (sent_at) {                        // measured network-repair demand
+                uint32_t age = (uint32_t)(now_ms() - sent_at);
+                // >2s is unrepairable within any gaming buffer: it belongs in
+                // the resend COUNT, not the sizing statistic
+                if (age < 2000 && age > RA.hw_resend_age.load())
+                    RA.hw_resend_age.store(age);
+            }
             std::vector<uint8_t> re;
             re.reserve(pkt.size() + 4);
             re.push_back(0x80); re.push_back(0xD6);
             re.push_back((uint8_t)(want >> 8)); re.push_back((uint8_t)want);
             re.insert(re.end(), pkt.begin(), pkt.end());
-            sendto(RA.ctrl_sock, (const char*)re.data(), (int)re.size(), 0,
-                   (sockaddr*)&dst, sizeof(dst));
-            RA.resends.fetch_add(1);
+            if (diagnosed_udp_send(UdpKind::Resend, s, (const char*)re.data(), (int)re.size(),
+                                   (sockaddr*)&from, fl)) RA.resends.fetch_add(1);
         }
     }
     return 0;
 }
 
+static void raop_stop_udp_workers() {
+    RA.udp_run.store(false);
+    // Each socket has a 500 ms I/O timeout. Never close/recycle its handle
+    // while a worker can still be executing recvfrom or sendto with it.
+    if (RA.tim_thread) {
+        WaitForSingleObject(RA.tim_thread, INFINITE);
+        CloseHandle(RA.tim_thread); RA.tim_thread = nullptr;
+    }
+    if (RA.ctrl_thread) {
+        WaitForSingleObject(RA.ctrl_thread, INFINITE);
+        CloseHandle(RA.ctrl_thread); RA.ctrl_thread = nullptr;
+    }
+}
+
 static void raop_send_sync(bool first) {
     uint8_t p[20];
     p[0] = first ? 0x90 : 0x80;
-    p[1] = 0xD4; p[2] = 0x00; p[3] = 0x07;
+    p[1] = 0xD4; p[2] = 0x00; p[3] = 0x04;
+    // ^ LITERAL-LATENCY MODE: flags=4 (the value Apple's own sender uses)
+    // instead of 7 — shairport-family receivers then skip the fixed
+    // +11025-frame (250 ms) offset and honor our announced latency exactly.
+    // NOTE: the similar-looking rep[3] = 0x07 in the resend-reply builder is
+    // a different field and must stay 0x07.
     uint32_t now_ts = RA.rtptime;                 // frame that "should play now"...
     uint32_t now_minus_lat = now_ts - RA.latency_frames;
     for (int i = 0; i < 4; ++i) p[4 + i] = (uint8_t)(now_minus_lat >> (24 - 8 * i));
@@ -2509,7 +4129,7 @@ static void raop_send_sync(bool first) {
     for (int i = 0; i < 4; ++i) p[16 + i] = (uint8_t)(now_ts >> (24 - 8 * i));
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons((u_short)RA.srv_ctrl);
     inet_pton(AF_INET, RA.host.c_str(), &a.sin_addr);
-    sendto(RA.ctrl_sock, (const char*)p, 20, 0, (sockaddr*)&a, sizeof(a));
+    diagnosed_udp_send(UdpKind::Sync, RA.ctrl_sock, (const char*)p, 20, (sockaddr*)&a, sizeof(a));
 }
 
 // float-frame pipe from the capture thread to the RAOP sender
@@ -2520,7 +4140,7 @@ static std::atomic<bool> g_raop_pipe_on{false};
 static void raop_pipe_push(float l, float r) {
     if (!g_raop_pipe_on.load()) return;
     EnterCriticalSection(&g_raop_cs);
-    if (g_raop_pipe.size() < 48000 * 2 * 4) {     // cap ~4 s
+    if (g_raop_pipe_on.load() && g_raop_pipe.size() < 48000 * 2 * 4) { // cap ~4 s
         g_raop_pipe.push_back(l);
         g_raop_pipe.push_back(r);
     }
@@ -2531,12 +4151,15 @@ static bool raop_handshake() {
     RtspConn& c = RA.rtsp;
     c = RtspConn();
     if (!c.open(RA.host, RA.rtsp_port)) { ui_log(L"[raop] RTSP connect failed"); return false; }
+    if (!RA.run.load()) return false;
     std::string my_ip = local_ip_for(RA.host);
+    if (my_ip.empty()) { ui_log(L"[raop] cannot determine the local route to the receiver"); return false; }
     char sid[32]; snprintf(sid, sizeof(sid), "%u", rng32());
     c.uri = "rtsp://" + my_ip + "/" + sid;
 
     bool ok = false;
     c.request("OPTIONS", "*", "", "", &ok);
+    if (!RA.run.load()) return false;
     if (!ok) ui_log(L"[raop] OPTIONS not 200 (continuing)");
 
     char sdp[512];
@@ -2546,11 +4169,13 @@ static bool raop_handshake() {
         "a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n",
         sid, my_ip.c_str(), RA.host.c_str());
     c.request("ANNOUNCE", c.uri, "Content-Type: application/sdp", sdp, &ok);
+    if (!RA.run.load()) return false;
     if (!ok) { ui_log(L"[raop] ANNOUNCE rejected (receiver may require encryption)"); return false; }
 
     int my_ctrl = bind_udp(RA.ctrl_sock);
     int my_tim  = bind_udp(RA.tim_sock);
-    bind_udp(RA.audio_sock);
+    int my_audio = bind_udp(RA.audio_sock);
+    if (!my_ctrl || !my_tim || !my_audio) { ui_log(L"[raop] UDP socket setup failed"); return false; }
     DWORD tmo = 500;
     setsockopt(RA.ctrl_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
     setsockopt(RA.tim_sock,  SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
@@ -2559,6 +4184,7 @@ static bool raop_handshake() {
              "Transport: RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;"
              "control_port=%d;timing_port=%d", my_ctrl, my_tim);
     std::string resp = c.request("SETUP", c.uri, thdr, "", &ok);
+    if (!RA.run.load()) return false;
     if (!ok) { ui_log(L"[raop] SETUP rejected"); return false; }
     c.session = rtsp_header(resp, "Session");
     std::string tr = rtsp_header(resp, "Transport");
@@ -2569,14 +4195,27 @@ static bool raop_handshake() {
     RA.srv_audio = tval("server_port");
     RA.srv_ctrl  = tval("control_port");
     RA.srv_tim   = tval("timing_port");
-    if (!RA.srv_audio) { ui_log(L"[raop] no server_port in SETUP reply"); return false; }
+    if (RA.srv_audio < 1 || RA.srv_audio > 65535 || RA.srv_ctrl < 1 || RA.srv_ctrl > 65535) {
+        ui_log(L"[raop] missing or invalid audio/control port in SETUP reply"); return false;
+    }
     ui_log8("[raop] SETUP ok — audio:" + std::to_string(RA.srv_audio) +
             " ctrl:" + std::to_string(RA.srv_ctrl) + " session:" + c.session);
 
-    if (!RA.tim_thread)
-        RA.tim_thread = CreateThread(nullptr, 0, raop_timing_thread, nullptr, 0, nullptr);
-    if (!RA.ctrl_thread)
-        RA.ctrl_thread = CreateThread(nullptr, 0, raop_control_thread, nullptr, 0, nullptr);
+    // A new worker must never answer a new session's retransmit request with
+    // an old session packet that happens to reuse the same 16-bit sequence.
+    EnterCriticalSection(&RA.hist_cs);
+    for (int hi = 0; hi < 1024; ++hi) {
+        RA.hist[hi].clear(); RA.hist_ts[hi] = 0;
+    }
+    LeaveCriticalSection(&RA.hist_cs);
+    RA.last_timing_ms.store(0);
+    RA.udp_run.store(true);
+    RA.tim_thread = CreateThread(nullptr, 0, raop_timing_thread, nullptr, 0, nullptr);
+    RA.ctrl_thread = CreateThread(nullptr, 0, raop_control_thread, nullptr, 0, nullptr);
+    if (!RA.tim_thread || !RA.ctrl_thread) {
+        raop_stop_udp_workers();
+        ui_log(L"[raop] cannot start timing/control worker"); return false;
+    }
 
     RA.seq = (uint16_t)rng32();
     RA.rtptime = (uint32_t)rng32();
@@ -2585,20 +4224,18 @@ static bool raop_handshake() {
     snprintf(rihdr, sizeof(rihdr), "Range: npt=0-\r\nRTP-Info: seq=%u;rtptime=%u",
              RA.seq, RA.rtptime);
     resp = c.request("RECORD", c.uri, rihdr, "", &ok);
+    if (!RA.run.load()) return false;
     if (!ok) { ui_log(L"[raop] RECORD rejected"); return false; }
     std::string al = rtsp_header(resp, "Audio-Latency");
     ui_log8("[raop] RECORD ok — receiver Audio-Latency: " + (al.empty() ? "?" : al) +
             " frames; using sender latency " + std::to_string(RA.latency_frames) +
             " (" + std::to_string(RA.latency_frames * 1000 / 44100) + " ms)");
-    long adv = al.empty() ? 0 : atol(al.c_str());
-    if (adv > 0 && (uint32_t)adv > RA.latency_frames) {
-        wchar_t w[200];
-        swprintf(w, 200, L"[raop] WARNING: requested buffer (%u ms) is below the "
-                 L"receiver's advertised minimum (%ld ms). Some firmwares play "
-                 L"SILENCE instead of clamping — if you hear nothing, increase the "
-                 L"AirPlay latency setting.", RA.latency_frames * 1000 / 44100, adv * 1000 / 44100);
-        ui_log(w);
-    }
+    // LITERAL-LATENCY MODE: the receiver still advertises Audio-Latency 11025
+    // in its RECORD response, but with sync flags=4 it never ADDS that offset —
+    // our announced latency is used verbatim. The old below-advertised-minimum
+    // warning would cry wolf at every low setting, so log the mode instead.
+    ui_log(L"[raop] literal-latency build: sync flags=4 \x2014 receiver honors the "
+           L"latency setting exactly (no hidden +250 ms)");
     // Start volume: -1 = never touch it (receiver's mixer / your headphone
     // buttons own it). Otherwise send ONE RAOP volume command mapped onto
     // the standard -30..0 dB range \x2014 the receiver honors these (the old
@@ -2708,7 +4345,17 @@ struct SincResampler {
 //     only a failed probe (with retry) declares the session dead
 // The verdict is posted via RA.ka_dead; the stream thread reconnects.
 // ---------------------------------------------------------------------------
-static bool raop_ka_request() {              // one guarded keepalive round-trip
+static bool raop_heartbeat_fresh(uint64_t now, uint64_t heartbeat) {
+    // A heartbeat may be sampled just after the caller sampled now.
+    return heartbeat && (heartbeat >= now || now - heartbeat < 8000);
+}
+
+static bool raop_should_reconnect(bool alive, bool connection_failed,
+                                  uint64_t now, uint64_t heartbeat) {
+    return connection_failed || (!alive && !raop_heartbeat_fresh(now, heartbeat));
+}
+
+static bool raop_ka_request(bool* connection_failed = nullptr) { // guarded round-trip
     // OPTIONS is the canonical side-effect-free RTSP ping. The previous
     // keepalive was SET_PARAMETER volume -0.0 — literally "set volume to
     // maximum" every 20 s, which fought the receiver's own volume buttons
@@ -2716,23 +4363,42 @@ static bool raop_ka_request() {              // one guarded keepalive round-trip
     bool alive = false;
     EnterCriticalSection(&RA.rtsp_cs);
     RA.rtsp.request("OPTIONS", "*", "", "", &alive);
+    if (connection_failed) *connection_failed = RA.rtsp.last_send_failed;
     LeaveCriticalSection(&RA.rtsp_cs);
     return alive;
+}
+
+// Measured minimum AirPlay buffer: max(sender demand, network demand) + 10ms
+// residue for what the sender cannot observe (no-loss late arrivals, receiver
+// wake). Single source of truth for the diag ticker and the stats panel.
+static int raop_suggested_floor_ms() {
+    if (!RA.run.load()) return -1;
+    uint64_t t0 = RA.sess_t0.load();          // <30s of evidence is not a floor:
+    if (!t0 || now_ms() - t0 < 30000) return -1;   // report "measuring" instead
+    double worst = (double)RA.hw_depth_ms.load();
+    double cg = (double)G.hw_capgap.load();
+    if (cg > worst) worst = cg;
+    uint32_t ra_age = RA.hw_resend_age.load();
+    double net = ra_age ? (double)ra_age + 8.0 : 0.0;
+    if (net > worst) worst = net;
+    return (((int)(worst + 10.0) + 4) / 5) * 5;
 }
 
 // Send one RAOP volume command (percent mapped linearly onto -30..0 dB).
 // Takes rtsp_cs itself; Windows critical sections are recursive, so calling
 // this from handshake (which already holds the lock) is safe.
-static void raop_send_volume_pct(int vp) {
+static void raop_send_volume_pct(int vp, bool logit) {
     double db = -30.0 * (double)(100 - vp) / 100.0;
     char vb[48]; snprintf(vb, sizeof(vb), "volume: %.2f\r\n", db);
     bool vok = false;
     EnterCriticalSection(&RA.rtsp_cs);
     RA.rtsp.request("SET_PARAMETER", RA.rtsp.uri, "Content-Type: text/parameters", vb, &vok);
     LeaveCriticalSection(&RA.rtsp_cs);
-    wchar_t lb[80];
-    swprintf(lb, 80, L"[raop] volume set to %d%% (%.1f dB)", vp, db);
-    ui_log(lb);
+    if (logit) {
+        wchar_t lb[80];
+        swprintf(lb, 80, L"[raop] volume set to %d%% (%.1f dB)", vp, db);
+        ui_log(lb);
+    }
 }
 
 static void raop_push_volume(int pct) { RA.vol_push.store(pct); }
@@ -2740,71 +4406,82 @@ static void raop_push_volume(int pct) { RA.vol_push.store(pct); }
 static DWORD WINAPI raop_liveness_thread(LPVOID) {
     uint64_t last_ka = now_ms(), last_probe = 0;
     while (RA.ka_run.load()) {
-        Sleep(250);
+        Sleep(100);       // 100 ms tick: live volume drags track at up to 10 cmd/s
         if (!RA.ka_run.load()) break;
         if (RA.ka_rearm.exchange(false)) { last_ka = now_ms(); last_probe = 0; }
         if (RA.ka_dead.load()) continue;     // verdict pending; reconnect owns RTSP
         { int vpush = RA.vol_push.exchange(-2);   // UI-queued live volume change
-          if (vpush >= 0) raop_send_volume_pct(vpush); }
+          if (vpush >= 0) raop_send_volume_pct(vpush, false); }
         uint64_t nowm = now_ms();
         uint64_t lt = RA.last_timing_ms.load();
-        bool hb_stale = lt && nowm - lt > 8000;
+        bool hb_stale = lt && !raop_heartbeat_fresh(nowm, lt);
         bool do_ka = nowm - last_ka >= 20000;
         bool do_probe = !do_ka && hb_stale && nowm - last_probe >= 10000;
         if (!do_ka && !do_probe) continue;
         if (do_ka) last_ka = nowm; else last_probe = nowm;
 
-        bool alive = raop_ka_request();
-        if (!alive) {                        // one benefit-of-the-doubt retry
+        bool connection_failed = false;
+        bool alive = raop_ka_request(&connection_failed);
+        if (!alive && !connection_failed) {  // retry a stall, not a closed connection
             Sleep(700);                      // harmless here: audio keeps flowing
             if (!RA.ka_run.load()) break;
-            alive = raop_ka_request();
+            alive = raop_ka_request(&connection_failed);
         }
+        if (!RA.ka_run.load()) break;
         if (alive) {
-            if (do_probe) RA.last_timing_ms.store(now_ms());  // proof of life; rearm
+            // OPTIONS proves only TCP reachability. Only the timing worker
+            // writes a received heartbeat; last_probe already rate-limits us.
             continue;
         }
-        if (do_probe) { RA.ka_dead.store(true); continue; }   // stale hb + dead RTSP
-
-        // Keepalive failed: the RTSP verdict is only trusted when the UDP side
-        // agrees. WiFi receivers (headphones especially) doze for seconds at a
-        // time; a stalled TCP round-trip while timing heartbeats still flow
-        // means the RTSP channel hiccupped, not the session.
+        // Re-evaluate AFTER blocking I/O: timing may have recovered while
+        // either OPTIONS request was waiting. Both probe paths use this rule.
         uint64_t lt2 = RA.last_timing_ms.load();
-        bool udp_fresh = lt2 && now_ms() - lt2 < 8000;
-        if (!udp_fresh) { RA.ka_dead.store(true); continue; }
-        EnterCriticalSection(&RA.rtsp_cs);
-        if (RA.rtsp.last_send_failed) {
-            // TCP is already gone; nothing left to preserve. Shairport
-            // receivers tie the session to this connection, so it is most
-            // likely ending anyway; have a channel ready.
-            ui_log(L"[raop] keepalive send failed; reopening RTSP channel");
-            RA.rtsp.close();
-            if (!RA.rtsp.open(RA.host, RA.rtsp_port))
-                ui_log(L"[raop] RTSP reopen failed; will retry next cycle");
-        } else {
-            // Reply stalled but the receiver is demonstrably alive. Shairport
-            // ties the session to THIS connection, so keep the socket open:
-            // closing it here would end the very session we are trying to
-            // protect. Only a stale heartbeat can end the session now.
-            ui_log(L"[raop] keepalive reply stalled (heartbeat fresh) \x2014 keeping session");
+        if (raop_should_reconnect(alive, connection_failed, now_ms(), lt2)) {
+            ui_log(connection_failed
+                ? L"[raop] RTSP connection failed \x2014 full session reconnect required"
+                : L"[raop] keepalive failed AND heartbeat stale \x2014 session lost");
+            RA.ka_dead.store(true);
+            continue;
         }
-        LeaveCriticalSection(&RA.rtsp_cs);
+        ui_log(L"[raop] keepalive reply stalled (heartbeat fresh) \x2014 keeping session");
     }
     return 0;
 }
 
 static DWORD WINAPI raop_stream_thread(LPVOID) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    uint64_t hs0_t0 = now_ms();
     EnterCriticalSection(&RA.rtsp_cs);           // a zombie liveness thread from a
     bool hs0 = raop_handshake();                 // prior session must not overlap
     LeaveCriticalSection(&RA.rtsp_cs);
-    if (!hs0) { RA.run = false; return 1; }
+    if (!hs0) {
+        if (RA.run.load()) {                     // real failure, not a user STOP
+            uint64_t d0 = now_ms() - hs0_t0;     // duration classifies the radio
+            ui_log(d0 > 15000
+                ? L"[raop] receiver did not answer, but its radio IS on "
+                  L"(suspended) \x2014 wake the headset and try again"
+                : L"[raop] receiver did not answer and its radio is GONE "
+                  L"(powered off / battery dead?) \x2014 check the headset");
+        }
+        RA.run = false;
+        // Mirror the normal teardown. A handshake that died after SETUP has live
+        // timing/control threads and three bound sockets; left as-is the non-null
+        // thread handles make every later session skip creating them (no timing
+        // replies, no resend server) and the sockets leak.
+        RA.rtsp.close();
+        raop_stop_udp_workers();
+        close_udp(RA.audio_sock); close_udp(RA.ctrl_sock); close_udp(RA.tim_sock);
+        return 1;
+    }
     RtspConn& c = RA.rtsp;
     RA.ka_dead.store(false); RA.ka_rearm.store(false);
     RA.vol_push.store(-2);
     RA.ka_run.store(true);
     RA.ka_thread = CreateThread(nullptr, 0, raop_liveness_thread, nullptr, 0, nullptr);
+    if (!RA.ka_thread) {
+        ui_log(L"[raop] cannot start liveness worker");
+        RA.run.store(false);
+    }
 
     // CLOCK-SLAVED streaming loop: a packet is transmitted the moment one
     // packet's worth of source audio exists. No wall-clock pacing, no cushion —
@@ -2835,12 +4512,97 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
     // [diag] servo health counters, reported every 10 s (read-only telemetry)
     uint64_t rg_next = now_ms() + 10000;
     uint64_t rg_starve_ev = 0, rg_starve_max = 0, rg_trim_ev = 0, rg_trim_ms = 0, rg_resync = 0;
+    uint64_t rg_dup_late_ev = 0, rg_dup_late_max = 0;   // duplicate wake lateness
     double rg_dmin = 1e18, rg_dmax = 0.0;
+    // session high-water marks -> empirically suggested minimum AirPlay buffer
+    double hw_depth = 0.0;
+    // ONE timestamp feeds both the soak gate and the ticker schedule: the
+    // gate must be provably open by the time the first report prints.
+    uint64_t sess_start = now_ms();
+    RA.sess_t0.store(sess_start);
+    uint64_t hw_next = sess_start + 30000;
+    // Spin-up exclusion: the first seconds contain pipeline-fill and servo
+    // settling transients (fill bursts, 37ms depth spikes) that say nothing
+    // about scheduler behavior. All floor marks re-arm at +3s; reconnect
+    // refills mute the depth mark the same way (a reconnect audibly gaps
+    // regardless of buffer, so its spike must not price the floor).
+    uint64_t hw_mute_until = sess_start + 3000;
+    bool hw_armed = false;
+    G.hw_capgap.store(0);
+    RA.hw_resend_age.store(0);
+    RA.hw_depth_ms.store(0);
+    uint64_t hw_resends0 = RA.resends.load();
+    // --- proactive duplicate transmission (ALWAYS ON in this build) ------
+    // Every packet is sent twice. The copy's delay is derived per session
+    // from the true receiver latency (setting + the hidden 250 ms flags==7
+    // offset): late enough to outlive a loss burst, early enough to beat
+    // the receiver's ~200 ms output-buffer hand-off. Doubles audio
+    // bandwidth. NOTE: duplicates heal gaps before the receiver notices
+    // them — use a non-duplicating build for resend-meter runs.
+    // LITERAL-LATENCY MODE: true receiver latency == our setting (no +250).
+    // the razor experiment (margin 220, 30 ms umbrella at the 250 setting)
+    // audibly lost the race — departures on the ~8 ms packet cadence plus a
+    // WiFi retry pushed too many copies past the hand-off. Back to 230
+    // (200 ms ALSA buffer + ~10 flight + ~20 spare): every armed setting
+    // now lands with real margin. Consequences: 250 is dup-OFF again
+    // (stock receiver genuinely can't hold an umbrella there), and 275
+    // carries D=45 — the exact twin of the old offset build's 25-setting
+    // (true 275, D=44) for controlled A/B. Rebuild with ~90 once the
+    // receiver config edit (0.06 s buffer + fast resends) is applied.
+    static const int DUP_HANDOFF_MARGIN_MS = 230;
+    int dup_delay = (int)(RA.latency_frames * 1000ull / 44100) - DUP_HANDOFF_MARGIN_MS;
+    if (dup_delay > 350) dup_delay = 350;
+    if (dup_delay < 30)  dup_delay = 0;   // can't beat the hand-off at this
+                                          // setting; all copies would arrive
+                                          // late, so save the bandwidth
+    std::deque<std::pair<uint16_t, uint64_t>> dupq;   // {seq, due_ms}
+    if (dup_delay) {
+        wchar_t dl[96];
+        swprintf(dl, 96, L"[dup] duplicate transmission ON, delay %d ms \x2014 "
+                 L"covers bursts up to ~%d ms (literal build)", dup_delay, dup_delay);
+        ui_log(dl);
+    } else {
+        ui_log(L"[dup] duplicates OFF at this setting \x2014 they cannot beat the "
+               L"receiver's output hand-off until its config is tuned");
+    }
     // Transmit-timeline PLL: locks the OUTPUT frame rate to exactly 44100 per
     // wall-second. measured_rate is only the seed; the servo nulls its noise.
+    // Publish a clean producer transition under the queue lock. The second
+    // flag check in raop_pipe_push prevents an old pre-lock producer from
+    // appending a stopped session's tail after this clear.
+    EnterCriticalSection(&g_raop_cs);
+    g_raop_pipe.clear();
     g_raop_pipe_on.store(true);
+    LeaveCriticalSection(&g_raop_cs);
 
     while (RA.run.load()) {
+        // Recovery must also run when capture supplies no frames. A verdict
+        // that arrives during the sender block is handled on the next tick.
+        if (!RA.ka_dead.load()) {
+        // Send any due duplicates first (runs on the starved path too). Same
+        // seq-verification and copy-under-lock idiom as the resend server.
+        if (dup_delay) {
+            uint64_t dnow = now_ms();
+            while (!dupq.empty() && dupq.front().second <= dnow) {
+                uint16_t want = dupq.front().first;
+                uint64_t late = dnow - dupq.front().second;   // wake lateness vs due
+                dupq.pop_front();
+                if (late > rg_dup_late_max) rg_dup_late_max = late;
+                if (late >= 5) rg_dup_late_ev++;   // beyond a 1 ms-timer wake; the
+                                                   // Win11 timer-throttle signature
+                                                   // is 8-15 ms here
+                std::vector<uint8_t> dpkt;
+                EnterCriticalSection(&RA.hist_cs);
+                std::vector<uint8_t>& h = RA.hist[want & 1023];
+                if (h.size() > 4 &&
+                    ((h[2] << 8) | h[3]) == want)     // slot still holds this seq
+                    dpkt = h;
+                LeaveCriticalSection(&RA.hist_cs);
+                if (!dpkt.empty())
+                    diagnosed_udp_send(UdpKind::Duplicate, RA.audio_sock,
+                        (const char*)dpkt.data(), (int)dpkt.size(), (sockaddr*)&dst, sizeof(dst));
+            }
+        }
         // CLOCK-SLAVED transmission: a packet leaves the moment one packet's
         // worth of source audio exists. No wall-clock pacing and no cushion —
         // the transmit rate is a direct function of the capture clock, so
@@ -2876,8 +4638,46 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
         int tgt = need_min + (int)(nrate * 2 / 1000);
         double depth = rs.frames_ahead();
         { double dms = depth * 1000.0 / nrate;        // [diag] depth range pre-trim
-          if (dms < rg_dmin) rg_dmin = dms;
-          if (dms > rg_dmax) rg_dmax = dms; }
+          if (dms < rg_dmin) rg_dmin = dms;               // per-window range stays
+          if (dms > rg_dmax) rg_dmax = dms;               // UNGATED: it shows truth
+          uint64_t nowh = now_ms();
+          if (!hw_armed && nowh >= sess_start + 3000) {
+              hw_armed = true;                            // spin-up over: floor
+              hw_depth = 0.0;                             // measurement begins
+              RA.hw_depth_ms.store(0);
+              G.hw_capgap.store(0);
+              RA.hw_resend_age.store(0);
+              hw_resends0 = RA.resends.load();
+          }
+          if (hw_armed && nowh >= hw_mute_until && dms > hw_depth) {
+              hw_depth = dms;
+              RA.hw_depth_ms.store((uint32_t)dms);
+          } }
+        if (now_ms() >= hw_next) {                    // [diag] measured buffer floor
+            // sender demand: worst capture gap / pipe excursion (measured).
+            // network demand: worst resend-request age + ~8ms repair flight
+            // (measured; 0 when the air lost nothing). Remaining +10ms covers
+            // only what cannot be measured from here: no-loss late arrivals
+            // and receiver thread wake.
+            uint32_t cg = G.hw_capgap.load();
+            uint32_t ra_age = RA.hw_resend_age.load();
+            unsigned long long rs = RA.resends.load() - hw_resends0;
+            int sug = raop_suggested_floor_ms();
+            if (sug >= 0) {                   // never fabricate a number: if the
+                wchar_t hb[224];              // gate is somehow shut, defer the
+                swprintf(hb, 224,             // report to the next window
+                    L"[diag] steady worst: cap gap %ums, pipe %.0fms, resend age %ums (%llu resends) "
+                    L"\x2192 %ls ~%dms (current %dms)",
+                    cg, hw_depth, ra_age, rs,
+                    (RA.latency_frames * 1000ull / 44100) < 400
+                        ? L"sender-only floor (resend gate shut below ~400 ms)"
+                        : (rs ? L"suggested min buffer"
+                              : L"suggested min buffer (no resends yet)"),
+                    sug, (int)(RA.latency_frames * 1000ull / 44100));
+                ui_log(hb);
+            }
+            hw_next += 30000;
+        }
         if (depth > nrate * 120 / 1000) {             // stall backlog: hard trim
             wchar_t tb[128];                          // [diag] every trim is audible
             swprintf(tb, 128, L"[diag] TRIM: pipe %.0fms -> %.0fms (audio skipped)",
@@ -2890,17 +4690,21 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
             depth = rs.frames_ahead();
         }
         if (now_ms() >= rg_next) {                    // [diag] 10 s servo report
+            report_udp_sends();
             double meas = G.measured_rate.load();
             int ppm = (int)((meas / (double)nrate - 1.0) * 1e6);
             wchar_t rb[192];
             swprintf(rb, 192,
-                L"[diag] raop: depth %.1f-%.1fms meas %+dppm starve=%llu(max %llums) trim=%llu(%llums) resync=%llu",
+                L"[diag] raop: depth %.1f-%.1fms meas %+dppm starve=%llu(max %llums) trim=%llu(%llums) resync=%llu duplate=%llu(max %llums) clk=%llu",
                 rg_dmin >= 1e17 ? 0.0 : rg_dmin, rg_dmax, ppm,
                 (unsigned long long)rg_starve_ev, (unsigned long long)rg_starve_max,
                 (unsigned long long)rg_trim_ev, (unsigned long long)rg_trim_ms,
-                (unsigned long long)rg_resync);
+                (unsigned long long)rg_resync,
+                (unsigned long long)rg_dup_late_ev, (unsigned long long)rg_dup_late_max,
+                (unsigned long long)g_clock_glitches.exchange(0));
             ui_log(rb);
             rg_starve_ev = rg_starve_max = rg_trim_ev = rg_trim_ms = rg_resync = 0;
+            rg_dup_late_ev = rg_dup_late_max = 0;
             rg_dmin = 1e18; rg_dmax = 0.0;
             rg_next += 10000;
         }
@@ -2955,11 +4759,24 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
         for (int i = 0; i < 4; ++i) pkt.push_back((uint8_t)(RA.rtptime >> (24 - 8 * i)));
         for (int i = 0; i < 4; ++i) pkt.push_back((uint8_t)(RA.ssrc >> (24 - 8 * i)));
         pkt.insert(pkt.end(), alac.begin(), alac.end());
-        sendto(RA.audio_sock, (const char*)pkt.data(), (int)pkt.size(), 0,
-               (sockaddr*)&dst, sizeof(dst));
+        diagnosed_udp_send(UdpKind::Audio, RA.audio_sock, (const char*)pkt.data(),
+                            (int)pkt.size(), (sockaddr*)&dst, sizeof(dst));
         EnterCriticalSection(&RA.hist_cs);
         RA.hist[RA.seq & 1023] = pkt;
+        RA.hist_ts[RA.seq & 1023] = now_ms();
         LeaveCriticalSection(&RA.hist_cs);
+        if (dup_delay) {
+            // The drain runs on EVERY loop iteration (~1 ms on the starved
+            // path, not the 8 ms packet cadence the old comment assumed), so a
+            // copy leaves ~1 ms after its due time whenever the 1 ms timer is
+            // honored. The -4 is therefore a fixed ~3 ms EARLY bias: effective
+            // spacing ~42 ms at the 275 setting, the value validated by ear
+            // (margin 220 = ~52 ms audibly lost the race). Kept on purpose;
+            // retune from the [diag] duplate meter, not by guesswork.
+            dupq.emplace_back((uint16_t)RA.seq,
+                              now_ms() + (uint64_t)(dup_delay - 4));
+            if (dupq.size() > 512) dupq.pop_front();   // paranoia bound
+        }
         first_pkt = false;
         RA.seq++;
         RA.rtptime += FR;
@@ -2968,6 +4785,7 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
 
         uint64_t sync_interval = (now_ms() < resync_burst_until) ? 50 : 1000;
         if (now_ms() - last_sync >= sync_interval) { raop_send_sync(false); last_sync = now_ms(); }
+        }
 
         // Liveness verdicts come from the dedicated liveness thread (keepalive
         // every 20 s + heartbeat-stale probes); this loop never blocks on RTSP.
@@ -2979,47 +4797,114 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
             // rtsp_cs held across each attempt: the liveness thread must not
             // touch the RTSP connection while it is being rebuilt.
             ui_log(L"[raop] session lost \x2014 reconnecting until it returns...");
+            {
+                int hb3 = g_hp_batt.load();
+                wchar_t bl[96];
+                if (hb3 >= 0)
+                    swprintf(bl, 96, L"[batt] last known headset battery: %d%% "
+                                     L"(Bluetooth-sourced; may be stale)", hb3);
+                else
+                    swprintf(bl, 96, L"[batt] headset battery unknown at loss time");
+                ui_log(bl);
+            }
             int attempt = 0;
-            bool back = false;
+            bool back = false, told_offnet = false;
+            int radio_cls = 0;   // 0 unknown, 1 answering (suspend), 2 gone
             while (RA.run.load()) {
                 EnterCriticalSection(&RA.rtsp_cs);
+                raop_stop_udp_workers();
                 c.close();
-                closesocket(RA.ctrl_sock); closesocket(RA.tim_sock); closesocket(RA.audio_sock);
+                close_udp(RA.ctrl_sock); close_udp(RA.tim_sock); close_udp(RA.audio_sock);
                 LeaveCriticalSection(&RA.rtsp_cs);
                 Sleep(attempt == 0 ? 400 : 2500);
+                if (!RA.run.load()) break;       // STOP/exit during the sleep: do not
+                                                 // enter a ~21 s blocking connect
                 attempt++;
+                uint64_t t_hs = now_ms();
                 EnterCriticalSection(&RA.rtsp_cs);
                 bool hs = raop_handshake();
                 LeaveCriticalSection(&RA.rtsp_cs);
                 if (hs) { back = true; break; }
-                if (attempt == 1 || attempt % 6 == 0) {
+                // A failed connect's DURATION tells us the radio state: a full
+                // ~21s SYN burn means ARP answered (radio alive: suspend); a
+                // ~3-6s failure means ARP itself died (powered off / battery
+                // dead). Log transitions — a mid-storm alive->gone flip is the
+                // battery-death signature (seen 2026-07-27 02:36:39->42).
+                uint64_t hdur = now_ms() - t_hs;
+                int cls = hdur > 15000 ? 1 : (hdur < 8000 ? 2 : 0);
+                if (cls && cls != radio_cls) {
+                    radio_cls = cls;
+                    ui_log(cls == 1
+                        ? L"[raop] receiver's radio IS answering (suspended, not powered off)"
+                        : L"[raop] receiver's radio is GONE (powered off or battery dead)");
+                }
+                if (attempt == 3 && !told_offnet) {
+                    // three consecutive connect failures (~70 s) = the receiver
+                    // is not on the network at all (standby, powered off, or
+                    // dropped WiFi). Say so plainly, once.
+                    told_offnet = true;
+                    ui_log(L"[raop] receiver is OFF THE NETWORK (headset standby/power/WiFi) "
+                           L"\x2014 will resume automatically the moment it returns");
+                }
+                if (attempt == 1 || attempt % 20 == 0) {
                     wchar_t b[96];
                     swprintf(b, 96, L"[raop] still trying (attempt %d)...", attempt);
                     ui_log(b);
                 }
             }
             if (back) {
+                EnterCriticalSection(&RA.hist_cs);   // old-timeline packets must
+                for (int hi = 0; hi < 1024; ++hi) {  // never answer new-seq requests
+                    RA.hist[hi].clear();
+                    RA.hist_ts[hi] = 0;
+                }
+                LeaveCriticalSection(&RA.hist_cs);
+                // The capture thread kept feeding the pipe through the whole
+                // outage, so it now holds outage-duration STALE audio (log
+                // evidence: 457ms backlog after a 0.44s outage, 1424ms after
+                // 1.7s — trim=1 each time). Previously resume worked only
+                // because the 120ms hard-trim discarded it; flush it here so
+                // resume begins at live audio by design.
+                EnterCriticalSection(&g_raop_cs);
+                g_raop_pipe.clear();
+                LeaveCriticalSection(&g_raop_cs);
+                rs.design(44100.0 / (double)G.native_rate.load());
+                rs_rate = G.native_rate.load();
+                hw_mute_until = now_ms() + 3000;   // refill spike: not floor data
                 dst.sin_port = htons((u_short)RA.srv_audio);
                 inet_pton(AF_INET, RA.host.c_str(), &dst.sin_addr);
+                qos_tag_voice(RA.audio_sock, dst);       // the handshake bound fresh
+                {   sockaddr_in cdst = dst;              // sockets: without re-tagging
+                    cdst.sin_port = htons((u_short)RA.srv_ctrl);  // the rest of the
+                    qos_tag_voice(RA.ctrl_sock, cdst); } // session runs untagged
+                rg_next = now_ms() + 10000;    // else an N-minute outage is followed
+                hw_next = now_ms() + 30000;    // by ~6N stale [diag] lines in a burst
+                dupq.clear();                  // copies queued before the outage
+                                               // are dead; sending them only
+                                               // pollutes the duplate meter
                 first_pkt = true;
                 sent_frames = 0;
-                RA.last_timing_ms.store(0);
+                was_streaming = false;
+                discontinuity = false;
+                starve_since = 0;
+                last_sync = now_ms();
+                resync_burst_until = 0;
                 RA.reconnects.fetch_add(1);
-                RA.ka_dead.store(false);       // verdict consumed
                 RA.ka_rearm.store(true);       // liveness timers restart fresh
                 RA.vol_push.store(-2);         // handshake already re-sent volume
+                RA.ka_dead.store(false);       // publish only after rearm/reset
                 ui_log(L"[raop] reconnected \x2014 stream resumed");
             }
         }
     }
 
+    EnterCriticalSection(&g_raop_cs);
     g_raop_pipe_on.store(false);
+    g_raop_pipe.clear();
+    LeaveCriticalSection(&g_raop_cs);
     RA.ka_run.store(false);                      // liveness thread down first:
     if (RA.ka_thread) {                          // TEARDOWN must own the conn
-        if (WaitForSingleObject(RA.ka_thread, 3000) != WAIT_OBJECT_0) {
-            shutdown(RA.rtsp.s, SD_BOTH);        // abort an in-flight keepalive recv
-            WaitForSingleObject(RA.ka_thread, 8000);
-        }
+        WaitForSingleObject(RA.ka_thread, INFINITE); // requests have an absolute deadline
         CloseHandle(RA.ka_thread); RA.ka_thread = nullptr;
     }
     bool tok = false;
@@ -3027,16 +4912,19 @@ static DWORD WINAPI raop_stream_thread(LPVOID) {
     c.request("TEARDOWN", c.uri, "", "", &tok);
     LeaveCriticalSection(&RA.rtsp_cs);
     c.close();
-    if (RA.tim_thread) { WaitForSingleObject(RA.tim_thread, 2000); CloseHandle(RA.tim_thread); RA.tim_thread = nullptr; }
-    if (RA.ctrl_thread) { WaitForSingleObject(RA.ctrl_thread, 2000); CloseHandle(RA.ctrl_thread); RA.ctrl_thread = nullptr; }
+    raop_stop_udp_workers();
     for (auto& hh : RA.hist) hh.clear();
-    closesocket(RA.audio_sock); closesocket(RA.ctrl_sock); closesocket(RA.tim_sock);
+    for (auto& ht : RA.hist_ts) ht = 0;          // hygiene: no stale timestamps
+    close_udp(RA.audio_sock); close_udp(RA.ctrl_sock); close_udp(RA.tim_sock);
     ui_log(L"[raop] session ended");
     return 0;
 }
 
-static void raop_start(const std::string& host, int port, uint32_t latency_ms) {
-    if (RA.run.load()) return;
+static bool raop_start(const std::string& host, int port, uint32_t latency_ms) {
+    if (RA.run.load()) {
+        ui_log(L"[raop] an AirPlay session is already live \x2014 stop it first");
+        return false;
+    }
     // A rapid STOP->START can land here while the old stream thread is still
     // tearing down (TEARDOWN + two joins can exceed raop_stop's 3 s wait).
     // Two threads sharing RA would race on the RTSP conn and sockets, so the
@@ -3044,15 +4932,37 @@ static void raop_start(const std::string& host, int port, uint32_t latency_ms) {
     if (RA.thread) {
         if (WaitForSingleObject(RA.thread, 15000) != WAIT_OBJECT_0) {
             ui_log(L"[raop] previous session is still closing \x2014 try again in a moment");
-            return;
+            return false;
         }
         CloseHandle(RA.thread); RA.thread = nullptr;
     }
+    RA.frames_sent.store(0);
+    RA.resends.store(0);
+    RA.reconnects.store(0);
+    stop_dlna_to_host(host);         // only now that we know we will start
     RA.host = host; RA.rtsp_port = port;
+    // LITERAL-LATENCY MODE floor: below ~100 ms the receiver's 50 ms sync
+    // watchdog trips on ordinary jitter and "repairs" itself by skipping
+    // frames / inserting silence in a loop. Hard-clamp to 100 ms.
+    if (latency_ms < 100) {
+        wchar_t w[120];
+        swprintf(w, 120, L"[raop] latency %d ms clamped to 100 ms (receiver floor)",
+                 latency_ms);
+        ui_log(w);
+        latency_ms = 100;
+    } else if (latency_ms < 250) {
+        ui_log(L"[raop] note: below 250 ms the stock receiver has no repair "
+               L"coverage \x2014 thin jitter cushion, and duplicates cannot beat "
+               L"its ~200 ms output hand-off until the receiver config is tuned");
+    }
     RA.latency_frames = latency_ms * 44100 / 1000;
+    RA.last_timing_ms.store(0);      // else the new session inherits the previous
+                                     // one's heartbeat and starts out "stale"
     RA.run.store(true);
     RA.thread = CreateThread(nullptr, 0, raop_stream_thread, nullptr, 0, nullptr);
+    if (!RA.thread) { RA.run.store(false); ui_log(L"[raop] cannot start stream worker"); return false; }
     ui_log8("[raop] starting AirPlay session to " + host + ":" + std::to_string(port));
+    return true;
 }
 static bool raop_is_running() { return RA.run.load(); }
 static void raop_stats(double& secs_sent, double& hb_age_s, unsigned long long& resends,
@@ -3063,12 +4973,16 @@ static void raop_stats(double& secs_sent, double& hb_age_s, unsigned long long& 
     resends = (unsigned long long)RA.resends.load();
     reconnects = RA.reconnects.load();
 }
-static void raop_stop() {
-    if (!RA.run.load()) return;
+static bool raop_stop(bool wait_full) {
+    // During window close, poll and let the UI defer destruction until true.
+    // A normal button STOP may wait briefly, retaining any unfinished worker.
     RA.run.store(false);
-    if (RA.thread && WaitForSingleObject(RA.thread, 3000) == WAIT_OBJECT_0) {
+    // The stream worker owns connection replacement. Do not read/shutdown
+    // its changing socket here; legacy connect retains the Windows timeout.
+    if (RA.thread && WaitForSingleObject(RA.thread, wait_full ? 0 : 3000) == WAIT_OBJECT_0) {
         CloseHandle(RA.thread); RA.thread = nullptr;
-    }   // on timeout keep the handle: raop_start drains it before reuse
+    }
+    return RA.thread == nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -3125,8 +5039,11 @@ static void raop_resolve() {
     ui_log(L"[mdns] resolving AirPlay receivers (_raop._tcp)...");
     std::vector<std::string> ifs = local_ipv4s();
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) { ui_log(L"[mdns] cannot create AirPlay resolver socket"); return; }
     sockaddr_in ba{}; ba.sin_family = AF_INET; ba.sin_addr.s_addr = INADDR_ANY;
-    bind(s, (sockaddr*)&ba, sizeof(ba));
+    if (bind(s, (sockaddr*)&ba, sizeof(ba)) != 0) {
+        closesocket(s); ui_log(L"[mdns] cannot bind AirPlay resolver socket"); return;
+    }
     DWORD tmo = 300;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
     int ttl = 4;
@@ -3370,18 +5287,45 @@ static void raop_resolve() {
 
 
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmdline, int ncmd) {
-    sess_log_open();
-    timeBeginPeriod(1);   // Sleep(1) is ~15.6 ms by default on Windows without this
-    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    g_ui_preview = cmdline && wcsstr(cmdline, L"uipreview") != nullptr;
+    HRESULT app_id_result = SetCurrentProcessExplicitAppUserModelID(L"LowCast.WiFiAudio");
+    if (!g_ui_preview) {
+        sess_log_open();
+        ui_log(L"[app] build 2026-09-26-regression: persistent battery alerts and verified regression fixes");
+        if (FAILED(app_id_result)) ui_log(L"[app] warning: explicit taskbar identity was not accepted by Windows");
+        timeBeginPeriod(1);   // Sleep(1) is ~15.6 ms by default on Windows without this
+        now_ms(); ntp_now();  // anchor the monotonic + NTP clocks while single-threaded
+    }
+    if (!g_ui_preview) { // Windows 11 silently ignores that request for a process whose window is
+        // minimized/occluded unless the process opts out. The duplicate scheduler
+        // and the 1 ms starved-path wake depend on it: throttled, copies leave up
+        // to ~15 ms late, past the receiver's hand-off. Resolved at runtime so it
+        // is harmless on Windows 10 and on headers that lack the definitions.
+        typedef BOOL (WINAPI *PSetProcInfo)(HANDLE, int, LPVOID, DWORD);
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        PSetProcInfo pSPI = k32 ? (PSetProcInfo)(void*)GetProcAddress(k32, "SetProcessInformation") : nullptr;
+        struct { ULONG Version, ControlMask, StateMask; } pt{ 1, 0x4, 0 };
+        // Version 1; ControlMask PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        // (0x4) with StateMask 0 = "disable the ignore policy": always honor it.
+        bool ok = pSPI && pSPI(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &pt, sizeof(pt));
+        ui_log(ok ? L"[app] timer-resolution throttling opt-out: ok (1 ms wakes even when minimized)"
+                  : L"[app] timer-resolution throttling opt-out: unavailable (pre-Windows 11: not needed)");
+    }
+    WSADATA wsa{};
+    if (!g_ui_preview) {
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    }
     InitializeCriticalSection(&G.cs);
     InitializeCriticalSection(&g_raop_cs);
     InitializeCriticalSection(&RA.hist_cs);
     InitializeCriticalSection(&RA.rtsp_cs);
+    if (!g_ui_preview)
+        start_detached_thread(battery_thread, L"[batt] cannot create battery polling worker");
 
     // Diagnostic mode:  LowCast.exe probe
     // Runs discovery + casts to the first renderer found, printing every step.
-    if (cmdline && wcsstr(cmdline, L"raoptest")) {
+    if (!g_ui_preview && cmdline && wcsstr(cmdline, L"raoptest")) {
         g_console_mode = true;
         g_probe_file = fopen("lowcast-raop.log", "w");
         char host[64] = "127.0.0.1"; int port = 5000, lat = 350, secs = 8;
@@ -3434,17 +5378,18 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmdline, int ncmd) {
         ui_log8("[raoptest] frames sent: " + std::to_string(fs) +
                 " (" + std::to_string(fs / 44100) + " s of audio), retransmitted " +
                 std::to_string(RA.resends.load()) + " packets on request");
-        raop_stop();
+        while (!raop_stop(true)) Sleep(50);
+        sess_log_close();
         return fs > 44100 ? 0 : 3;
     }
-    if (cmdline && wcsstr(cmdline, L"probe")) {
+    if (!g_ui_preview && cmdline && wcsstr(cmdline, L"probe")) {
         g_console_mode = true;
         g_probe_file = fopen("lowcast-probe.log", "w");
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {     // launched from a terminal
             FILE* f; freopen_s(&f, "CONOUT$", "w", stdout);
         }                                               // else keep inherited stdout
         ui_log(L"[probe] LowCast diagnostic mode");
-        CloseHandle(CreateThread(nullptr, 0, http_server_thread, nullptr, 0, nullptr));
+        start_detached_thread(http_server_thread, L"[http] cannot create server worker");
         Sleep(300);
         ssdp_discover();
         mdns_sweep();
@@ -3493,27 +5438,44 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmdline, int ncmd) {
             stop_capture();
         }
         ui_log(L"[probe] done");
+        while (!raop_stop(true) || !stop_capture()) Sleep(50);
+        sess_log_close();
         return n ? 0 : 2;
     }
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
+    init_dark_resources();
 
-    WNDCLASSW wc{};
+    g_app_icon = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(IDI_LOWCAST), IMAGE_ICON,
+        GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+    g_app_icon_small = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(IDI_LOWCAST), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = wndproc;
     wc.hInstance = hi;
     wc.lpszClassName = L"LowCastWnd";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    RegisterClassW(&wc);
+    wc.hIcon = g_app_icon;
+    wc.hIconSm = g_app_icon_small;
+    wc.hbrBackground = g_br_bg;
+    RegisterClassExW(&wc);
 
-    int wx = (int)GetPrivateProfileIntW(L"LowCast", L"winx", -100000, ini_path().c_str());
-    int wy = (int)GetPrivateProfileIntW(L"LowCast", L"winy", -100000, ini_path().c_str());
-    bool havepos = wx > -3000 && wx < 8000 && wy > -3000 && wy < 8000;
+    int wx = g_ui_preview ? -100000 :
+        (int)GetPrivateProfileIntW(L"LowCast", L"winx", -100000, ini_path().c_str());
+    int wy = g_ui_preview ? -100000 :
+        (int)GetPrivateProfileIntW(L"LowCast", L"winy", -100000, ini_path().c_str());
+    bool havepos = !g_ui_preview && wx > -3000 && wx < 8000 && wy > -3000 && wy < 8000;
     HWND h = CreateWindowW(L"LowCastWnd",
+        g_ui_preview ? L"LowCast Dark UI Preview - SAFE MOCK DATA (no audio/network)" :
         L"LowCast: Minimal-Latency WiFi Audio Streamer (DLNA & AirPlay)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         havepos ? wx : CW_USEDEFAULT, havepos ? wy : CW_USEDEFAULT,
         600, 540, nullptr, nullptr, hi, nullptr);
+    SendMessageW(h, WM_SETICON, ICON_BIG, (LPARAM)g_app_icon);
+    SendMessageW(h, WM_SETICON, ICON_SMALL, (LPARAM)g_app_icon_small);
+    apply_dark_titlebar(h);
     ShowWindow(h, ncmd);
 
     MSG msg;
@@ -3521,8 +5483,19 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, PWSTR cmdline, int ncmd) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    WSACleanup();
-    timeEndPeriod(1);
+    if (!g_ui_preview) sess_log_close();
+    // Window destruction discards posted messages without freeing lParam.
+    // The logger no longer targets it; reclaim any final queued log strings.
+    while (PeekMessageW(&msg, nullptr, WM_APP_LOG, WM_APP_LOG, PM_REMOVE))
+        delete (std::wstring*)msg.lParam;
+    UnregisterClassW(BATTERY_ALERT_CLASS, hi);
+    if (g_app_icon_small) DestroyIcon(g_app_icon_small);
+    if (g_app_icon) DestroyIcon(g_app_icon);
+    UnregisterClassW(L"LowCastWnd", hi);
+    free_dark_resources();
+    if (!g_ui_preview) {
+        WSACleanup();
+        timeEndPeriod(1);
+    }
     return 0;
 }
-
