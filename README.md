@@ -1,93 +1,69 @@
 # LowCast
 
-A minimal-latency system audio streamer for Windows. LowCast captures whatever Windows is playing and streams it over WiFi to DLNA/UPnP renderers and AirPlay receivers, with a design that treats every millisecond of sender-side buffering as a bug.
-
-The entire application is a single C++ file with no external dependencies beyond the Windows SDK. No codec libraries, no frameworks, no installer.
-
-## Features
-
-- **System audio capture** via WASAPI shared-mode loopback, event-driven, with an IAudioClient3 "period driver" that holds the audio engine at its minimum mixing period (typically ~3 ms instead of the default 10 ms)
-- **DLNA/UPnP streaming** as uncompressed LPCM (L16/L24, big-endian) or WAV (16/24-bit), discovered via SSDP, controlled via AVTransport SOAP
-- **AirPlay streaming** to RAOP-compatible receivers using verbatim (uncompressed) ALAC framing at 44.1 kHz/16-bit, with RTP retransmission, NTP-style timing replies, and periodic sync packets
-- **High quality rate conversion**: a 96-tap Kaiser-windowed polyphase sinc resampler converts the capture rate (usually 48 kHz) to the 44.1 kHz AirPlay clock. Passband is flat to roughly 19.8 kHz and alias rejection measures better than -95 dBc, below the 16-bit noise floor
-- **TPDF dither** on every float to 16-bit quantization
-- **Clock-slaved transmission**: packets leave the moment one packet of audio exists. A proportional depth servo (authority +/-400 ppm) pins the sender pipe about 2 ms above a single packet, so sender-side buffering cannot drift or accumulate
-- **Follows the default output device**: switching the Windows output device mid-stream is handled seamlessly
-- **Silence keepalive**: wall-clock silence is injected when nothing is playing so renderers never stall and re-buffer
-- **Built-in latency test**: an optional 1 kHz metronome tick with a synchronized on-screen flash lets you measure true end-to-end latency by ear
-- **Session resilience**: lost AirPlay sessions reconnect automatically until stopped, and live sessions survive a failed device rescan
+LowCast is a native Windows application that captures system audio with WASAPI loopback and streams stereo PCM over a local network. It supports DLNA/UPnP MediaRenderer devices and unencrypted AirPlay v1 (RAOP) receivers. It was built for the HiFiMAN HE1000 WiFi path, but the DLNA path can work with other standards-compliant renderers.
 
 ## Requirements
 
-- Windows 10 or 11, x64
-- A network where multicast works (SSDP uses 239.255.255.250:1900, mDNS uses 224.0.0.251:5353)
+- 64-bit Windows 10 or Windows 11
+- A receiver on the same IPv4 LAN
+- Visual Studio 2022 Build Tools with MSVC `14.44.35207`
+- Windows SDK `10.0.26100.0`
 
-## Building
+The tool locations are set near the top of `build.ps1`; update them if your Visual Studio or SDK installation differs.
 
-### MinGW-w64 (including cross-compilation from Linux)
+## Build
 
-```
-x86_64-w64-mingw32-g++ -O2 -municode -mwindows -std=c++17 \
-  -o LowCast.exe LowCast-source.cpp \
-  -lws2_32 -liphlpapi -lole32 -lcomctl32 -lwinmm \
-  -static -static-libgcc -static-libstdc++
-```
+From PowerShell in the repository root:
 
-The static flags produce a self-contained binary with no runtime DLL dependencies.
-
-### MSVC
-
-Open a Developer Command Prompt and run:
-
-```
-cl /O2 /std:c++17 /DUNICODE /D_UNICODE LowCast-source.cpp ^
-  /link /SUBSYSTEM:WINDOWS ws2_32.lib iphlpapi.lib ole32.lib ^
-  comctl32.lib winmm.lib user32.lib gdi32.lib
+```powershell
+.\build.ps1
 ```
 
-## Usage
+This performs a serial x64 release build at below-normal process priority and writes `LowCast-Dark.exe`. Windows PowerShell 5.1 and PowerShell 7 are supported.
 
-1. Launch the executable. Allow it through Windows Firewall on **private networks** when prompted. This matters: AirPlay discovery relies on unicast mDNS replies that a blocking firewall will silently eat.
-2. Discovered DLNA renderers and AirPlay receivers appear as buttons. Click one to start streaming, click again to stop.
-3. Pick a capture device, or leave it on default to follow whatever Windows is using.
-4. Choose a stream format for DLNA (LPCM/WAV, 16/24-bit) and a buffer size for AirPlay (25 to 350 ms).
-5. Use **Rescan** to re-run discovery at any time.
+The deterministic regression executable is built and run separately:
 
-The window log reports everything: capture format, engine period, discovery results, RTSP handshake details, retransmission counts, and reconnect attempts.
-
-### Choosing the AirPlay buffer
-
-The buffer setting is the playback offset the receiver is asked to schedule, not sender-side buffering. Low values (25 to 75 ms) work on receivers with good clocks and strong WiFi. If a receiver's RECORD response advertises a minimum latency above your setting, the log will warn you; some firmwares play silence rather than clamping, so raise the setting if you hear nothing.
-
-### Latency measurement
-
-Enable the metronome to mix a 1 kHz tick into the stream every two seconds, synchronized with a visual flash in the UI. The gap between flash and sound is your end-to-end latency. A local beep option provides a reference click on the PC itself for A/B comparison.
-
-## Quality notes
-
-The pipeline aims for transparency rather than nominal losslessness, and it is honest about what shared-mode capture can and cannot do:
-
-- WASAPI loopback captures the output of the Windows mixer. Windows has already mixed and rate-converted every application to the device's shared format, so bit-exactness relative to a source file is impossible for any loopback capture on any software. Everything downstream of the mixer, however, is either bit-transparent (LPCM, verbatim ALAC) or measurably below the 16-bit noise floor (resampler, dither).
-- For the cleanest AirPlay chain, set the Windows output device format to 44.1 kHz. The resampler then runs at unity ratio and only applies the servo's parts-per-million corrections.
-- The optional upsample setting on the DLNA path trades fidelity for renderer latency and uses simple interpolation. Leave it at 1x when quality matters.
-
-## Headless test mode
-
-A command-line mode exercises the full RAOP stack against a receiver without capturing audio:
-
-```
-LowCast.exe raoptest <host> <port> <latency_ms> <seconds> [drift_ppm] [meas_err_ppm]
+```powershell
+.\build.ps1 -Tests
+.\build\regression.exe
 ```
 
-It streams a 440 Hz tone, optionally simulating soundcard clock drift and deliberate rate-measurement error to stress the depth servo, and logs pipe depth over time to `lowcast-raop.log`. Append `gaps` to simulate periodic 150 ms dropouts.
+## Use
 
-## Troubleshooting
+1. Run `LowCast-Dark.exe`.
+2. Choose the Windows output device to capture, plus the DLNA format and rate.
+3. Select **Rescan** if the receiver is not listed.
+4. Select **START** beside a DLNA or AirPlay receiver. Use **STOP** before changing receivers or transport.
 
-- **No AirPlay receivers found**: check the log for `[mdns] port 5353 unavailable`, which means another service (often Bonjour or iTunes) holds the port exclusively; discovery falls back to a legacy socket in that case. Also verify the firewall rule covers private networks.
-- **Receivers found on first scan but not rescan**: fixed in the current source. Discovery now queries on every network interface and accumulates split mDNS record refreshes across packets.
-- **Audible dropouts on WiFi**: raise the AirPlay buffer. Retransmission and reconnect counters in the log help distinguish packet loss from clock problems.
-- **Renderer takes seconds to start**: that is the renderer's own pre-buffer. The sender adds roughly 10 to 15 ms end to end; everything else lives on the receiving side.
+The vertical volume control sets the AirPlay receiver volume. Leaving it at `auto` preserves receiver control until the slider is moved. The latency beep can help compare the visible flash with the sound arrival time. `LowCast-Dark.exe uipreview` opens a local mock UI without starting audio, discovery, networking, battery polling, logging, or settings writes.
 
-## License
+## Latency
 
-MIT
+DLNA is the compatibility and fidelity path; renderer firmware commonly adds hundreds of milliseconds of buffering. The 2x and 4x DLNA rate choices can reduce that firmware buffer at the cost of bandwidth.
+
+AirPlay is the lower-latency path. The default sender buffer is 150 ms, while 250 ms is the safer general starting point. Values below 250 ms have less loss-repair margin, and values below 100 ms are clamped to 100 ms. Receiver firmware and WiFi conditions determine the usable floor.
+
+## Battery warnings
+
+When Windows exposes a Bluetooth battery property, LowCast shows the most recent value in the main window. It opens an application alert at 40%, 20%, and 10%. The alert stays open until **Acknowledge** is pressed; closing it with Alt+F4 does not dismiss it. If the battery crosses a more urgent threshold while the alert is open, the same window updates. Alerts re-arm for a new charge cycle at 80%.
+
+The main label shows `LOW` at 40% or below, `CRIT` at 20% or below, and `URGENT` at 10% or below. A temporary missing battery property retains the last valid reading.
+
+The value is Bluetooth-sourced and may be stale while the headset is in WiFi mode. A dash means no battery value has been observed.
+
+## Network and firewall
+
+Allow LowCast on **Private** Windows networks. Discovery uses SSDP multicast on UDP 1900 and mDNS on UDP 5353. DLNA receivers fetch the stream from TCP ports 16600-16619. AirPlay uses the receiver's advertised RTSP and UDP ports. VPNs, guest-network isolation, multicast filtering, or a firewall can prevent discovery or playback.
+
+LowCast has no authentication or encryption layer for its local HTTP/RAOP traffic; use it on a trusted LAN.
+
+## Known limitations
+
+- AirPlay 2 pairing, FairPlay, and HomeKit encryption are not implemented.
+- Only one AirPlay session is active at a time, and a receiver cannot use its DLNA and AirPlay outputs simultaneously.
+- End-to-end latency, reconnect behavior, and battery freshness depend on receiver firmware, drivers, and network conditions.
+- The application is Windows/x64 only.
+
+## Validation
+
+The repository includes noninteractive checks for the embedded icon, dark-control wiring, offscreen volume rendering, battery alert state and hidden-window acknowledgment, bounded log behavior, AirPlay button reset, and vertical volume dragging. The automated checks do not replace real receiver, audio-device, WiFi-loss, sleep/resume, or headset-battery testing.

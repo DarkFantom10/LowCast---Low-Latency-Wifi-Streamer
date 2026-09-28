@@ -1,0 +1,81 @@
+2026-09-28 00:06:42.295 [app] build 2026-09-26-regression: persistent battery alerts and verified regression fixes
+2026-09-28 00:06:42.295 [app] timer-resolution throttling opt-out: ok (1 ms wakes even when minimized)
+2026-09-28 00:06:42.297 [batt] HE1000 WiFi set up Hands-Free AG battery: 100%
+2026-09-28 00:06:42.328 [app] restored saved capture device
+2026-09-28 00:06:42.328 [app] LowCast started — zero sender buffering, TCP_NODELAY, LPCM
+2026-09-28 00:06:42.328 [app] NOTE: DLNA has an inherent receiver-side buffer (often several hundred ms) fixed in the device firmware — it is the high-fidelity path, not the low-latency one. For gaming/low latency use the AirPlay button.
+2026-09-28 00:06:42.328 [http] server listening on port 16600
+2026-09-28 00:06:42.337 [audio] engine already at minimum period
+2026-09-28 00:06:42.338 [ssdp] searching on: 10.0.0.5  (3.5 s)
+2026-09-28 00:06:42.341 [ssdp] response from 10.0.0.1 -> http://10.0.0.1:56688/Public_UPNP_gatedesc.xml
+2026-09-28 00:06:42.342 [audio] event-driven capture active
+2026-09-28 00:06:42.342 [ssdp] response from 10.0.0.1 -> http://10.0.0.1:49152/wps_device.xml
+2026-09-28 00:06:42.343 [audio] capturing: 48000 Hz, 2 ch, float 32-bit source
+2026-09-28 00:06:42.539 [ssdp] response from 10.0.0.13 -> http://10.0.0.13:49152/uuid-92fd13e0-e4c6-d169-c39a-58e4ebffa392/description.xml
+2026-09-28 00:06:42.757 [ssdp] response from 10.0.0.1 -> http://10.0.0.1:8200/rootDesc.xml
+2026-09-28 00:06:43.252 [ssdp] response from 10.0.0.7 -> http://10.0.0.7:80/description.xml
+2026-09-28 00:06:46.987 [ssdp] skipping InternetGod (Gateway) (no AVTransport service/controlURL)
+2026-09-28 00:06:46.988 [ssdp] skipping WPS Access Point (no AVTransport service/controlURL)
+2026-09-28 00:06:46.998 [ssdp]   AVTransport control: http://10.0.0.13:49152/uuid-92fd13e0-e4c6-d169-c39a-58e4ebffa392/ctl-urn-schemas-upnp-org-service-AVTransport-1
+2026-09-28 00:06:46.998 [ssdp]   services: AVTransport:1, QPlay:2, RenderingControl:1, ConnectionManager:1
+2026-09-28 00:06:46.998 [ssdp] found renderer: HIFIMAN-STREAMER-6R1HL @ 10.0.0.13
+2026-09-28 00:06:47.186 [ssdp] skipping InternetGod (no AVTransport service/controlURL)
+2026-09-28 00:06:47.195 [ssdp] skipping Hue Bridge (10.0.0.7) (no AVTransport service/controlURL)
+2026-09-28 00:06:47.195 [mdns] resolving AirPlay receivers (_raop._tcp)...
+2026-09-28 00:06:50.716 [mdns] AirPlay receiver: HIFIMAN-STREAMER-6R1HL @ 10.0.0.13:5000  (via multicast listener)
+2026-09-28 00:06:50.716 [mdns]   TXT: sf=0x4 fv=5.0.2 am=ShairportSync vs=105.1 tp=TCP,UDP vn=65537 md=0,1,2 ss=16 sr=44100 da=true sv=false et=0,1 ek=1 cn=0,1 ch=2 txtvers=1 pw=false
+2026-09-28 00:06:50.716 [mdns]   encryption types (et): 0,1  -> unencrypted ACCEPTED (LowCast compatible)
+2026-09-28 00:06:51.580 [raop] starting AirPlay session to 10.0.0.13:5000
+2026-09-28 00:06:51.594 [raop] SETUP ok — audio:6003 ctrl:6001 session:1
+2026-09-28 00:06:51.634 [raop] receiver engaged (timing heartbeat started)
+2026-09-28 00:06:51.637 [raop] RECORD ok — receiver Audio-Latency: 11025 frames; using sender latency 12127 (274 ms)
+2026-09-28 00:06:51.637 [raop] literal-latency build: sync flags=4 — receiver honors the latency setting exactly (no hidden +250 ms)
+2026-09-28 00:06:51.644 [raop] volume set to 72% (-8.4 dB)
+2026-09-28 00:06:51.647 [net] QoS voice flow accepted for 10.0.0.13:6003; error=0 (API acceptance does not confirm router priority)
+2026-09-28 00:06:51.647 [net] QoS voice flow accepted for 10.0.0.13:6001; error=0 (API acceptance does not confirm router priority)
+2026-09-28 00:06:51.649 [dup] duplicate transmission ON, delay 44 ms — covers bursts up to ~44 ms (literal build)
+2026-09-28 00:06:52.347 [diag] cap: pkts=1000 disc=1 maxgap=12ms fill=0ms
+2026-09-28 00:07:01.649 [send] audio: ok=1252 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:01.649 [send] duplicate: ok=1246 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:01.649 [send] timing: ok=7 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:01.649 [send] sync: ok=20 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:01.649 [diag] raop: depth 0.0-19.0ms meas +5ppm starve=0(max 13ms) trim=0(0ms) resync=0 duplate=0(max 2ms) clk=0
+2026-09-28 00:07:02.347 [diag] cap: pkts=1001 disc=0 maxgap=12ms fill=0ms
+2026-09-28 00:07:11.648 [send] audio: ok=1251 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:11.648 [send] duplicate: ok=1254 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:11.648 [send] timing: ok=3 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:11.648 [send] sync: ok=20 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:11.648 [diag] raop: depth 1.0-19.0ms meas +54ppm starve=0(max 13ms) trim=0(0ms) resync=0 duplate=0(max 2ms) clk=0
+2026-09-28 00:07:12.343 [diag] cap: pkts=999 disc=0 maxgap=12ms fill=0ms
+2026-09-28 00:07:21.649 [diag] steady worst: cap gap 12ms, pipe 19ms, resend age 0ms (0 resends) → sender-only floor (resend gate shut below ~400 ms) ~30ms (current 274ms)
+2026-09-28 00:07:21.649 [send] audio: ok=1254 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:21.649 [send] duplicate: ok=1252 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:21.649 [send] timing: ok=3 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:21.649 [send] sync: ok=20 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:21.649 [diag] raop: depth 1.1-19.0ms meas +1ppm starve=0(max 13ms) trim=0(0ms) resync=0 duplate=0(max 2ms) clk=0
+2026-09-28 00:07:22.347 [diag] cap: pkts=1001 disc=0 maxgap=12ms fill=0ms
+2026-09-28 00:07:31.649 [send] audio: ok=1252 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:31.649 [send] duplicate: ok=1253 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:31.649 [send] timing: ok=4 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:31.649 [send] sync: ok=20 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:31.649 [diag] raop: depth 1.0-19.0ms meas -155ppm starve=0(max 13ms) trim=0(0ms) resync=0 duplate=0(max 2ms) clk=0
+2026-09-28 00:07:32.343 [diag] cap: pkts=999 disc=0 maxgap=12ms fill=0ms
+2026-09-28 00:07:41.649 [send] audio: ok=1252 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:41.649 [send] duplicate: ok=1253 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:41.649 [send] timing: ok=3 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:41.649 [send] sync: ok=20 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:41.649 [diag] raop: depth 1.0-19.0ms meas +19ppm starve=0(max 14ms) trim=0(0ms) resync=0 duplate=0(max 2ms) clk=0
+2026-09-28 00:07:42.346 [diag] cap: pkts=1001 disc=0 maxgap=12ms fill=0ms
+2026-09-28 00:07:51.649 [diag] steady worst: cap gap 12ms, pipe 19ms, resend age 0ms (0 resends) → sender-only floor (resend gate shut below ~400 ms) ~30ms (current 274ms)
+2026-09-28 00:07:51.649 [send] audio: ok=1254 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:51.649 [send] duplicate: ok=1252 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:51.649 [send] timing: ok=3 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:51.649 [send] sync: ok=20 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:07:51.649 [diag] raop: depth 1.0-19.0ms meas +264ppm starve=0(max 13ms) trim=0(0ms) resync=0 duplate=0(max 2ms) clk=0
+2026-09-28 00:07:52.343 [diag] cap: pkts=999 disc=0 maxgap=12ms fill=0ms
+2026-09-28 00:08:01.650 [send] audio: ok=1252 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:08:01.650 [send] duplicate: ok=1253 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:08:01.650 [send] timing: ok=4 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:08:01.650 [send] sync: ok=20 failed=0 short=0 max_ms=0 last_wsa=0 errors{}
+2026-09-28 00:08:01.650 [diag] raop: depth 1.0-19.0ms meas +159ppm starve=0(max 13ms) trim=0(0ms) resync=0 duplate=0(max 2ms) clk=0
+2026-09-28 00:08:02.348 [diag] cap: pkts=1000 disc=0 maxgap=12ms fill=0ms
